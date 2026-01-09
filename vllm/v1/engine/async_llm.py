@@ -708,6 +708,81 @@ class AsyncLLM(EngineClient):
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
+    async def poc_request(self, action: str, payload: dict) -> dict:
+        """Send a PoC (Proof of Compute) request to the engine.
+
+        For AsyncLLMEngine (non-multiprocessing mode), we directly
+        create and use a PoCManager.
+        """
+        if not hasattr(self, '_poc_manager'):
+            from vllm.poc.manager import PoCManager
+            self._poc_manager = PoCManager(
+                model_executor=self.engine_core,
+                model_config=self.model_config,
+                vllm_config=self.vllm_config,
+            )
+
+        manager = self._poc_manager
+
+        if action == "init":
+            from vllm.poc.config import PoCConfig
+            config = PoCConfig(**payload)
+            manager.init_round(config)
+            return {"status": "initialized", "pow_status": manager.get_status()}
+
+        elif action == "start_generate":
+            manager.start_generate()
+            return {"status": "generating", "pow_status": manager.get_status()}
+
+        elif action == "start_validate":
+            manager.start_validate()
+            return {"status": "validating", "pow_status": manager.get_status()}
+
+        elif action == "stop":
+            manager.stop_round()
+            return {"status": "stopped", "pow_status": manager.get_status()}
+
+        elif action == "status":
+            return manager.get_status()
+
+        elif action == "run_batch":
+            batch = manager.run_batch()
+            return {
+                "nonces": batch.nonces,
+                "distances": batch.dist,
+                "pow_status": manager.get_status(),
+            }
+
+        elif action == "run_batch_with_state":
+            return manager.run_batch_with_state()
+
+        elif action == "validate":
+            nonces = payload.get("nonces", [])
+            public_key = payload.get("public_key", "")
+            distances, valid = manager.validate(nonces, public_key)
+            return {
+                "nonces": nonces,
+                "distances": distances,
+                "valid": valid,
+            }
+
+        elif action == "generate_for_nonces":
+            return manager.generate_for_nonces(
+                nonces=payload.get("nonces", []),
+                block_hash=payload.get("block_hash", ""),
+                public_key=payload.get("public_key", ""),
+                r_target=payload.get("r_target", 0.5),
+                seq_len=payload.get("seq_len", 256),
+                return_vectors=payload.get("return_vectors", False),
+            )
+
+        elif action == "teardown_generate_hooks":
+            manager.teardown_generate_hooks()
+            return {"status": "ok"}
+
+        else:
+            raise ValueError(f"Unknown PoC action: {action}")
+
     async def collective_rpc(
         self,
         method: str,
