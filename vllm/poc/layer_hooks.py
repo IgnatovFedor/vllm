@@ -66,7 +66,7 @@ class LayerHouseholderHook:
         self.hooks: List = []
         self.reflection_vectors: List[torch.Tensor] = []
         self.block_hash = block_hash
-        # self._setup(model, block_hash, device, hidden_size)
+        self._setup(model, block_hash, device, hidden_size)
     
     def _find_layers(self, model: torch.nn.Module) -> List[torch.nn.Module]:
         """Find transformer layers in a model-agnostic way."""
