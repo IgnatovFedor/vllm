@@ -168,3 +168,17 @@ class EngineClient(ABC):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""
         raise NotImplementedError
+
+    @abstractmethod
+    async def poc_request(self, action: str, payload: dict) -> dict:
+        """Send a PoC (Proof of Compute) request to the engine.
+
+        Args:
+            action: The PoC action to perform ("init", "start_generate",
+                   "start_validate", "stop", "status", "run_batch", "validate")
+            payload: Action-specific data
+
+        Returns:
+            Result dictionary from the engine
+        """
+        ...
