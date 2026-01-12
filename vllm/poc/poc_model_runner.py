@@ -31,6 +31,7 @@ def _create_prefill_attn_metadata(
     seq_len: int,
     device: torch.device,
     attn_backend,
+    dtype: torch.dtype,
 ):
     """Create prefill attention metadata for the given backend.
     
@@ -47,57 +48,54 @@ def _create_prefill_attn_metadata(
     backend_name = attn_backend.get_name()
     
     if backend_name == "XFORMERS":
-        from vllm.attention.backends.xformers import XFormersMetadata
-        return XFormersMetadata(
+        from vllm.v1.attention.backends.xformers import XFormersAttentionMetadata
+        return XFormersAttentionMetadata(
+            num_actual_tokens=num_tokens,
+            max_query_len=seq_len,
+            query_start_loc=seq_start_loc,
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            block_table=torch.empty((batch_size, 0), dtype=torch.int32, device=device),
+            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
             num_prefills=batch_size,
             num_prefill_tokens=num_tokens,
+            num_decodes=0,
             num_decode_tokens=0,
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            seq_lens=seq_lens,
-            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
-            max_prefill_seq_len=seq_len,
-            max_decode_seq_len=0,
-            query_start_loc=seq_start_loc.clone(),
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
-            block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
-            use_cuda_graph=False,
-            multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=False,
         )
     elif backend_name == "FLASHINFER":
-        from vllm.attention.backends.flashinfer import FlashInferMetadata
+        from vllm.v1.attention.backends.flashinfer import FlashInferMetadata
         return FlashInferMetadata(
+            num_actual_tokens=num_tokens,
+            q_data_type=dtype,
+            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            max_q_len=seq_len,
+            max_q_len_prefill=seq_len,
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            block_table_tensor=torch.empty((batch_size, 0), dtype=torch.int32, device=device),
+            prefill_use_trtllm=False,
+            decode_use_trtllm=False,
+            num_decodes=0,
+            num_decode_tokens=0,
             num_prefills=batch_size,
             num_prefill_tokens=num_tokens,
-            num_decode_tokens=0,
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            max_prefill_seq_len=seq_len,
-            seq_start_loc=seq_start_loc,
-            multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=False,
-            use_cuda_graph=False,
-            is_profile_run=True,
+            use_cascade=False,
         )
     else:
-        # Default to FlashAttention
-        from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
         return FlashAttentionMetadata(
-            num_prefills=batch_size,
-            num_prefill_tokens=num_tokens,
-            num_decode_tokens=0,
+            num_actual_tokens=num_tokens,
+            max_query_len=seq_len,
+            query_start_loc=seq_start_loc,
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            block_table=torch.empty((batch_size, 0), dtype=torch.int32, device=device),
             slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            seq_lens=seq_lens,
-            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
-            max_prefill_seq_len=seq_len,
-            max_decode_seq_len=0,
-            query_start_loc=seq_start_loc.clone(),
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
-            block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
-            use_cuda_graph=False,
-            multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=False,
+            use_cascade=False,
+            common_prefix_len=0,
+            cu_prefix_query_lens=None,
+            prefix_kv_lens=None,
+            suffix_kv_lens=None,
         )
 
 
@@ -183,8 +181,33 @@ def execute_poc_forward(
     
     # Create attention metadata and positions
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    attn_backend = worker.model_runner.attn_backend
-    attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
+    
+    # Get attention backend from attn_groups
+    if hasattr(worker.model_runner, 'attn_groups') and len(worker.model_runner.attn_groups) > 0:
+        # Get the first attention group from the first kv_cache_group
+        attn_backend = worker.model_runner.attn_groups[0][0].backend
+    else:
+        # Fallback: try to get from model layers directly
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+        from vllm.config import get_layers_from_vllm_config
+        layers = get_layers_from_vllm_config(worker_vllm_config, AttentionLayerBase, None)
+        if layers:
+            # Get backend from first attention layer
+            first_layer_name = list(layers.keys())[0]
+            attn_backend = layers[first_layer_name].get_attn_backend()
+        else:
+            raise AttributeError("Cannot determine attention backend: attn_groups not initialized and no layers found")
+    
+    # Create attention metadata - v1 models expect a dict mapping layer names to metadata
+    single_attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend, dtype)
+    
+    # Get all attention layer names from the model
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.config import get_layers_from_vllm_config
+    attention_layers = get_layers_from_vllm_config(worker_vllm_config, AttentionLayerBase, None)
+    
+    # Create dict mapping each layer name to the same metadata
+    attn_metadata = {layer_name: single_attn_metadata for layer_name in attention_layers.keys()}
     
     # =========================================================================
     # TP SYNC: Pre-forward rendezvous (after PP recv, before model forward)
@@ -200,13 +223,19 @@ def execute_poc_forward(
     torch.cuda.synchronize()
     
     # Forward pass - all TP ranks now enter together
-    with set_forward_context(attn_metadata, worker_vllm_config):
+    # Pass num_tokens to set_forward_context for proper initialization
+    num_tokens = batch_size * seq_len
+    
+    with set_forward_context(attn_metadata, worker_vllm_config, num_tokens=num_tokens):
         hidden_states = model(
             input_ids=None,
             positions=positions.flatten(),
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
         )
+        
+        # Sync inside the forward context to catch errors early
+        torch.cuda.synchronize()
     
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
@@ -217,8 +246,24 @@ def execute_poc_forward(
         return None
     
     # Extract last token hidden state
+    # Ensure hidden_states is contiguous and has correct shape
+    num_tokens = batch_size * seq_len
+    if hidden_states.shape[0] != num_tokens:
+        raise ValueError(
+            f"Shape mismatch: hidden_states.shape[0]={hidden_states.shape[0]}, "
+            f"expected {num_tokens} (batch_size={batch_size} * seq_len={seq_len})"
+        )
+    
+    # Reshape to (batch_size, seq_len, hidden_size)
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
-    last_hidden = hidden_states[:, -1, :].float()
+    
+    # Extract last token: (batch_size, hidden_size)
+    # Clone to ensure we have a valid tensor with its own memory
+    last_hidden = hidden_states[:, -1, :].clone().float()
+    
+    # Ensure last_hidden is contiguous before norm operation
+    if not last_hidden.is_contiguous():
+        last_hidden = last_hidden.contiguous()
     
     # Normalize to unit sphere
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
