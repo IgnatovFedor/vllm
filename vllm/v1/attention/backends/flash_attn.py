@@ -588,9 +588,10 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            # Skip cache write if all slots are PAD_SLOT_ID (no valid slots to write)
+            # Skip cache write if slot_mapping is empty (no valid slots to write)
+            # Using numel() is safe during CUDA graph capture as it only accesses shape
             slot_mapping = attn_metadata.slot_mapping
-            if slot_mapping.numel() > 0 and (slot_mapping >= 0).any():
+            if slot_mapping.numel() > 0:
                 reshape_and_cache_flash(
                     key,
                     value,
@@ -620,6 +621,29 @@ class FlashAttentionImpl(AttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
+            # For prefill-only (no KV cache writes), use key/value directly instead of cache
+            # Check if block_table is empty (no cached blocks) or slot_mapping is empty
+            # Using numel() is safe during CUDA graph capture as it only accesses shape
+            use_cache = (block_table.numel() > 0 and 
+                        attn_metadata.slot_mapping.numel() > 0)
+            
+            if use_cache:
+                k_tensor = key_cache
+                v_tensor = value_cache
+                block_table_arg = block_table
+                seqused_k_arg = seqused_k
+                cu_seqlens_k_arg = None
+            else:
+                # Prefill-only: use current key/value tensors directly
+                # Pass block_table=None to use non-paged attention path
+                # For non-paged path, we need cu_seqlens_k instead of seqused_k
+                k_tensor = key[:num_actual_tokens]
+                v_tensor = value[:num_actual_tokens]
+                block_table_arg = None
+                seqused_k_arg = None
+                # Construct cu_seqlens_k from seq_lens (same as cu_seqlens_q for prefill)
+                cu_seqlens_k_arg = cu_seqlens_q
+
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
@@ -637,18 +661,19 @@ class FlashAttentionImpl(AttentionImpl):
             else:
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
+                    k=k_tensor,
+                    v=v_tensor,
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
+                    seqused_k=seqused_k_arg,
                     max_seqlen_k=max_seqlen_k,
+                    cu_seqlens_k=cu_seqlens_k_arg,
                     softmax_scale=self.scale,
                     causal=attn_metadata.causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=self.sliding_window,
-                    block_table=block_table,
+                    block_table=block_table_arg,
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,

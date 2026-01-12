@@ -269,6 +269,12 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Must be a YAML with the following options: "
         "https://docs.vllm.ai/en/latest/configuration/serve_args.html",
     )
+    parser.add_argument(
+        "--enable-poc",
+        action="store_true",
+        default=False,
+        help="Enable Proof of Compute (PoC) endpoints at /api/v1/pow/*.",
+    )
     parser = FrontendArgs.add_cli_args(parser)
     parser = AsyncEngineArgs.add_cli_args(parser)
 
