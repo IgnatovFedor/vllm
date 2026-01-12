@@ -1541,6 +1541,10 @@ def build_app(args: Namespace) -> FastAPI:
     app.include_router(router)
     app.root_path = args.root_path
 
+    if args.enable_poc is True:
+        from vllm.poc.routes import router as poc_router
+        app.include_router(poc_router)
+
     mount_metrics(app)
 
     app.add_middleware(
@@ -1657,6 +1661,7 @@ async def init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
+    state.poc_enabled = getattr(args, 'enable_poc', False)
 
     supported_tasks = await engine_client.get_supported_tasks()
     logger.info("Supported tasks: %s", supported_tasks)

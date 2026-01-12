@@ -49,6 +49,8 @@ def _create_prefill_attn_metadata(
     
     if backend_name == "XFORMERS":
         from vllm.v1.attention.backends.xformers import XFormersAttentionMetadata
+        # Use empty slot_mapping when all slots are PAD_SLOT_ID to avoid kernel launch
+        slot_mapping = torch.empty((0,), dtype=torch.long, device=device)
         return XFormersAttentionMetadata(
             num_actual_tokens=num_tokens,
             max_query_len=seq_len,
@@ -56,7 +58,7 @@ def _create_prefill_attn_metadata(
             max_seq_len=seq_len,
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
             block_table=torch.empty((batch_size, 0), dtype=torch.int32, device=device),
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            slot_mapping=slot_mapping,
             num_prefills=batch_size,
             num_prefill_tokens=num_tokens,
             num_decodes=0,
@@ -64,10 +66,12 @@ def _create_prefill_attn_metadata(
         )
     elif backend_name == "FLASHINFER":
         from vllm.v1.attention.backends.flashinfer import FlashInferMetadata
+        # Use empty slot_mapping when all slots are PAD_SLOT_ID to avoid kernel launch
+        slot_mapping = torch.empty((0,), dtype=torch.long, device=device)
         return FlashInferMetadata(
             num_actual_tokens=num_tokens,
             q_data_type=dtype,
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            slot_mapping=slot_mapping,
             max_q_len=seq_len,
             max_q_len_prefill=seq_len,
             max_seq_len=seq_len,
@@ -83,6 +87,10 @@ def _create_prefill_attn_metadata(
         )
     else:
         from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+        # Use empty slot_mapping when all slots are PAD_SLOT_ID to avoid kernel launch
+        # This prevents CUDA illegal memory access when reshape_and_cache_flash
+        # is called with all-padding slots
+        slot_mapping = torch.empty((0,), dtype=torch.long, device=device)
         return FlashAttentionMetadata(
             num_actual_tokens=num_tokens,
             max_query_len=seq_len,
@@ -90,7 +98,7 @@ def _create_prefill_attn_metadata(
             max_seq_len=seq_len,
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
             block_table=torch.empty((batch_size, 0), dtype=torch.int32, device=device),
-            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            slot_mapping=slot_mapping,
             use_cascade=False,
             common_prefix_len=0,
             cu_prefix_query_lens=None,
