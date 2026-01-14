@@ -5,25 +5,45 @@ This mimics vLLM's /chat/completion TP synchronization:
 - Non-driver TP workers block until they receive the broadcast
 - All TP ranks then enter model forward together (NCCL collectives align)
 """
+from typing import List, Optional, Dict, Any
+
 import torch
 import torch.distributed as dist
-from typing import List, Optional, Dict, Any
 
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.forward_context import set_forward_context
-from vllm.sequence import IntermediateTensors
-
-from .gpu_random import (
+from vllm.poc.gpu_random import (
     generate_inputs,
-    generate_target,
     random_pick_indices,
     apply_haar_rotation,
 )
+from vllm.poc.layer_hooks import LayerHouseholderHook, poc_forward_context
+from vllm.sequence import IntermediateTensors
 
 # Default k_dim (can be overridden per-request)
 DEFAULT_K_DIM = 12
+
+
+def _ensure_layer_hooks(worker, block_hash: str, hidden_size: int) -> None:
+    """Ensure layer hooks are installed on the worker for the given block_hash.
+    
+    Caches hooks on worker._poc_layer_hooks. If block_hash changes, detaches
+    old hooks and installs new ones (per-round transform changes).
+    """
+    model = worker.model_runner.model
+    device = worker.device
+    
+    existing_hook = getattr(worker, '_poc_layer_hooks', None)
+    
+    if existing_hook is not None:
+        if existing_hook.block_hash == block_hash:
+            return
+        existing_hook.detach()
+    
+    hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
+    worker._poc_layer_hooks = hook
 
 
 def _create_prefill_attn_metadata(
@@ -164,22 +184,26 @@ def execute_poc_forward(
         dist.barrier(group=tp_group.cpu_group)
     
     torch.cuda.synchronize()
-    
+
     # Forward pass
     # Note: We pass a dummy input_ids tensor even though inputs_embeds will be used.
     # This is because torch.compile expects input_ids to be a tensor based on how
     # the model was compiled during profile run.
     num_tokens = batch_size * seq_len
     dummy_input_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
+    # Ensure layer hooks are installed for this block_hash (lazy + cached)
+    _ensure_layer_hooks(worker, block_hash, hidden_size)
 
+    # Forward pass with PoC context (activates layer hook transformations)
     with set_forward_context(attn_metadata, worker_vllm_config):
-        hidden_states = model(
-            input_ids=dummy_input_ids,
-            positions=positions.flatten(),
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-        )
-    
+        with poc_forward_context():
+            hidden_states = model(
+                input_ids=dummy_input_ids,
+                positions=positions.flatten(),
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+            )
+
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
         if isinstance(hidden_states, IntermediateTensors):

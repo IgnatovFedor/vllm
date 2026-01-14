@@ -66,7 +66,7 @@ class LayerHouseholderHook:
         self.hooks: List = []
         self.reflection_vectors: List[torch.Tensor] = []
         self.block_hash = block_hash
-        # self._setup(model, block_hash, device, hidden_size)
+        self._setup(model, block_hash, device, hidden_size)
     
     def _find_layers(self, model: torch.nn.Module) -> List[torch.nn.Module]:
         """Find transformer layers in a model-agnostic way."""
@@ -110,39 +110,34 @@ class LayerHouseholderHook:
         vLLM decoder layers typically return (hidden_states, residual).
         We must transform BOTH to prevent residual connections from
         preserving untransformed values.
-        
-        EXPERIMENT: Also normalize to unit sphere at each layer to break
-        magnitude-based structure accumulation.
         """
         def hook(module, input, output):
             # Early exit if not in PoC forward context - pass through unchanged
             if not is_poc_forward_active():
                 return output
-            
+
             v = self.reflection_vectors[layer_idx]
-            
-            def normalize_and_transform(x):
-                # First normalize to unit sphere (break magnitude structure)
-                x_norm = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
-                # Then apply Householder reflection
-                return apply_householder(x_norm, v.to(x_norm.dtype))
-            
+
+            def transform(x):
+                # Apply Householder reflection (preserves magnitude)
+                return apply_householder(x, v.to(x.dtype))
+
             if isinstance(output, tuple):
                 if len(output) >= 2:
                     # (hidden_states, residual, ...) format - transform both
                     hidden = output[0]
                     residual = output[1]
                     rest = output[2:] if len(output) > 2 else ()
-                    transformed_hidden = normalize_and_transform(hidden)
-                    transformed_residual = normalize_and_transform(residual)
+                    transformed_hidden = transform(hidden)
+                    transformed_residual = transform(residual)
                     return (transformed_hidden, transformed_residual) + rest
                 else:
                     # Single element tuple
                     hidden = output[0]
-                    transformed = normalize_and_transform(hidden)
+                    transformed = transform(hidden)
                     return (transformed,)
             else:
-                transformed = normalize_and_transform(output)
+                transformed = transform(output)
                 return transformed
         
         return hook
