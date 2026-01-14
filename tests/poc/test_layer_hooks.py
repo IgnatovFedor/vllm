@@ -67,14 +67,17 @@ class TestLayerHouseholderHookContextAware:
     
     @pytest.fixture
     def hook_instance(self, mock_model):
-        """Create a LayerHouseholderHook instance."""
+        """Create a LayerHouseholderHook instance with setup called."""
         device = torch.device("cpu")
-        return LayerHouseholderHook(
+        hook = LayerHouseholderHook(
             model=mock_model,
             block_hash="test_block_hash",
             device=device,
             hidden_size=64,
         )
+        # Manually call _setup since __init__ doesn't call it (lazy init)
+        hook._setup(mock_model, "test_block_hash", device, 64)
+        return hook
     
     def test_hook_passes_through_when_context_inactive(self, hook_instance):
         """Hook should pass through output unchanged when context is False."""

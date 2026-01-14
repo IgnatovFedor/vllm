@@ -197,47 +197,40 @@ def random_pick_indices(
     return out
 
 
-def generate_haar_orthogonal_matrices(
+def apply_haar_rotation(
     block_hash: str,
     public_key: str,
     nonces: List[int],
-    k: int,
+    x: torch.Tensor,
     device: torch.device,
-    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Generate per-nonce Haar-random orthogonal matrices of shape [k, k].
+    """Apply Haar-random rotation via k-1 Householder reflections.
     
-    Uses seeded Gaussian -> QR -> sign-fix to get Haar distribution over O(k).
+    Avoids cuSOLVER dependency (no QR decomposition).
+    Each nonce gets a deterministic chain of k-1 reflections.
     
     Args:
         block_hash: Block hash for seeding
         public_key: Public key for seeding
         nonces: List of nonce values
-        k: Matrix dimension
+        x: Input vectors of shape [batch_size, k]
         device: Target device
-        dtype: Output dtype (default float32)
     
     Returns:
-        Orthogonal matrices tensor of shape [batch_size, k, k]
+        Rotated vectors of shape [batch_size, k]
     """
+    batch_size, k = x.shape
     if k <= 0:
         raise ValueError(f"k must be positive, got k={k}")
-
-    Qs = []
-    for nonce in nonces:
-        seed = _seed_from_string(
-            f"{block_hash}_{public_key}_nonce_{nonce}_haar_qr_{k}"
-        )
-        A = _normal(seed, k * k, device).view(k, k).to(dtype)
-
-        Q, R = torch.linalg.qr(A, mode="reduced")
-
-        # Haar sign-fix: make diag(R) positive by scaling columns of Q.
-        diag = torch.diagonal(R, 0)
-        signs = torch.sign(diag)
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        Q = Q * signs.unsqueeze(0)
-
-        Qs.append(Q)
-
-    return torch.stack(Qs, dim=0)
+    
+    y = x.clone()
+    
+    for i, nonce in enumerate(nonces):
+        for j in range(k - 1):
+            v = generate_householder_vector(
+                f"{block_hash}_{public_key}_nonce_{nonce}_haar_hh_{k}_{j}",
+                k, device,
+            )
+            y[i] = apply_householder(y[i], v.to(y.dtype))
+    
+    return y

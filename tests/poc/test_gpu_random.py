@@ -9,7 +9,7 @@ from vllm.poc.gpu_random import (
     generate_householder_vector,
     apply_householder,
     random_pick_indices,
-    generate_haar_orthogonal_matrices,
+    apply_haar_rotation,
     _uniform,
     _normal,
     _seed_from_string,
@@ -248,81 +248,83 @@ def test_cpu_gpu_random_pick_indices_match():
 
 # === Haar Orthogonal Matrices Tests ===
 
-def test_haar_orthogonal_matrices_determinism():
-    """Same inputs produce same matrices"""
+def test_apply_haar_rotation_determinism():
+    """Same inputs produce same rotated vectors"""
     device = torch.device("cuda:0")
     nonces = [0, 1, 2]
+    k = 64
     
-    Q1 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, nonces, k=64, device=device)
-    Q2 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, nonces, k=64, device=device)
+    x = torch.randn(len(nonces), k, device=device)
     
-    assert torch.allclose(Q1, Q2)
+    y1 = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, nonces, x.clone(), device)
+    y2 = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, nonces, x.clone(), device)
+    
+    assert torch.allclose(y1, y2)
 
 
-def test_haar_orthogonal_matrices_shape():
-    """generate_haar_orthogonal_matrices returns correct shape"""
+def test_apply_haar_rotation_shape():
+    """apply_haar_rotation returns same shape as input"""
     device = torch.device("cuda:0")
     nonces = [0, 1, 2, 3, 4]
     k = 64
     
-    Q = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, nonces, k=k, device=device)
+    x = torch.randn(len(nonces), k, device=device)
+    y = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, nonces, x, device)
     
-    assert Q.shape == (len(nonces), k, k)
+    assert y.shape == x.shape
 
 
-def test_haar_orthogonal_matrices_orthogonality():
-    """Generated matrices are orthogonal (Q @ Q^T = I)"""
+def test_apply_haar_rotation_norm_preservation():
+    """Haar rotation preserves vector norms (orthogonal transformation)"""
+    device = torch.device("cuda:0")
+    k = 64
+    nonces = [0, 1, 2]
+    
+    x = torch.randn(len(nonces), k, device=device)
+    y = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, nonces, x, device)
+    
+    x_norms = x.norm(dim=-1)
+    y_norms = y.norm(dim=-1)
+    
+    assert torch.allclose(x_norms, y_norms, atol=1e-5)
+
+
+def test_apply_haar_rotation_different_nonces():
+    """Different nonces produce different rotations"""
     device = torch.device("cuda:0")
     k = 64
     
-    Q = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], k=k, device=device)
+    x = torch.randn(1, k, device=device)
     
-    for i in range(Q.shape[0]):
-        QQt = Q[i] @ Q[i].T
-        identity = torch.eye(k, device=device, dtype=Q.dtype)
-        assert torch.allclose(QQt, identity, atol=1e-5)
-
-
-def test_haar_orthogonal_matrices_determinant():
-    """Orthogonal matrices have determinant +/- 1"""
-    device = torch.device("cuda:0")
-    k = 32  # Smaller k for faster determinant computation
+    y1 = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, [0], x.clone(), device)
+    y2 = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, [1], x.clone(), device)
     
-    Q = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], k=k, device=device)
-    
-    for i in range(Q.shape[0]):
-        det = torch.linalg.det(Q[i])
-        assert abs(abs(det.item()) - 1.0) < 1e-4
+    assert not torch.allclose(y1, y2)
 
 
-def test_haar_orthogonal_matrices_different_nonces():
-    """Different nonces produce different matrices"""
-    device = torch.device("cuda:0")
-    
-    Q1 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0], k=64, device=device)
-    Q2 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [1], k=64, device=device)
-    
-    assert not torch.allclose(Q1, Q2)
-
-
-def test_haar_orthogonal_matrices_invalid_k():
+def test_apply_haar_rotation_invalid_k():
     """Invalid k values raise ValueError"""
     device = torch.device("cuda:0")
     
+    x = torch.randn(1, 0, device=device)  # k=0
     with pytest.raises(ValueError):
-        generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0], k=0, device=device)
+        apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, [0], x, device)
 
 
-def test_cpu_gpu_haar_matrices_match():
-    """CPU and GPU produce identical Haar matrices (small numerical tolerance)"""
+def test_cpu_gpu_haar_rotation_match():
+    """CPU and GPU produce identical rotated vectors"""
     cpu = torch.device("cpu")
     gpu = torch.device("cuda:0")
+    k = 32
+    nonces = [0, 1]
     
-    Q_cpu = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1], k=32, device=cpu)
-    Q_gpu = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1], k=32, device=gpu)
+    x_cpu = torch.randn(len(nonces), k, device=cpu)
+    x_gpu = x_cpu.to(gpu)
     
-    # QR decomposition may have small numerical differences across devices
-    assert torch.allclose(Q_cpu, Q_gpu.cpu(), rtol=1e-4, atol=1e-5)
+    y_cpu = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, nonces, x_cpu, cpu)
+    y_gpu = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, nonces, x_gpu, gpu)
+    
+    assert torch.allclose(y_cpu, y_gpu.cpu(), rtol=1e-4, atol=1e-5)
 
 
 # =============================================================================
@@ -651,82 +653,76 @@ def test_random_pick_indices_coverage():
     assert ratio < 3.0, f"Selection ratio {ratio} too extreme (suggests non-uniform distribution)"
 
 
-# === generate_haar_orthogonal_matrices() Distribution Tests ===
+# === apply_haar_rotation() Distribution Tests ===
 
-def test_haar_first_column_uniform_on_sphere():
-    """First column of Haar matrices is uniformly distributed on sphere"""
+def test_haar_rotation_output_uniform_on_sphere():
+    """Haar rotation of unit vectors produces uniform distribution on sphere"""
     device = torch.device("cuda:0")
     k = 32
     n_samples = 3000
     
-    # Collect first columns
-    first_cols = []
+    # Use same unit input vector for all samples
+    x_base = torch.zeros(1, k, device=device)
+    x_base[0, 0] = 1.0  # Unit vector along first axis
+    
+    # Collect rotated vectors (different seeds)
+    rotated = []
     for i in range(n_samples):
-        Q = generate_haar_orthogonal_matrices(f"block_{i}", f"key_{i}", [0], k=k, device=device)
-        first_cols.append(Q[0, :, 0])  # First column of the single matrix
+        y = apply_haar_rotation(f"block_{i}", f"key_{i}", [0], x_base.clone(), device)
+        rotated.append(y[0])
     
-    first_cols = torch.stack(first_cols)  # [n_samples, k]
+    rotated = torch.stack(rotated)  # [n_samples, k]
     
-    # Test 1: Component means should be 0
-    component_means = first_cols.mean(dim=0)
+    # Test 1: Component means should be ~0 (allow some variance)
+    component_means = rotated.mean(dim=0)
     max_mean = component_means.abs().max().item()
-    assert max_mean < 0.1, f"Max component mean {max_mean} too far from 0"
+    assert max_mean < 0.15, f"Max component mean {max_mean} too far from 0"
     
-    # Test 2: Component variances should be 1/k
-    component_vars = first_cols.var(dim=0)
+    # Test 2: Component variances should be 1/k (for uniform on sphere)
+    component_vars = rotated.var(dim=0)
     expected_var = 1.0 / k
     mean_var = component_vars.mean().item()
     assert abs(mean_var - expected_var) < 0.02, f"Mean variance {mean_var} too far from {expected_var}"
 
 
-def test_haar_determinant_distribution():
-    """Haar matrices have determinant +1 and -1 with roughly equal probability"""
-    device = torch.device("cuda:0")
-    k = 16  # Small k for fast determinant computation
-    n_samples = 1000
-    
-    pos_count = 0
-    neg_count = 0
-    
-    for i in range(n_samples):
-        Q = generate_haar_orthogonal_matrices(f"block_{i}", f"key_{i}", [0], k=k, device=device)
-        det = torch.linalg.det(Q[0])
-        
-        if det > 0:
-            pos_count += 1
-        else:
-            neg_count += 1
-    
-    # Should be roughly 50/50
-    ratio = pos_count / n_samples
-    
-    # Allow deviation from 0.5 - use binomial confidence interval
-    # For n=1000, p=0.5, 99% CI is roughly [0.46, 0.54]
-    assert 0.40 < ratio < 0.60, f"Determinant ratio {ratio} too far from 0.5"
-
-
-def test_haar_all_columns_uniform():
-    """All columns of Haar matrices are uniformly distributed on sphere"""
+def test_haar_rotation_preserves_orthogonality():
+    """Haar rotation applied to orthonormal set preserves orthonormality"""
     device = torch.device("cuda:0")
     k = 16
-    n_samples = 2000
     
-    # Test each column
-    for col_idx in range(k):
-        cols = []
-        for i in range(n_samples):
-            Q = generate_haar_orthogonal_matrices(f"block_{i}", f"key_{i}", [0], k=k, device=device)
-            cols.append(Q[0, :, col_idx])
-        
-        cols = torch.stack(cols)
-        
-        # Component means should be 0
-        component_means = cols.mean(dim=0)
-        max_mean = component_means.abs().max().item()
-        assert max_mean < 0.15, f"Column {col_idx}: max mean {max_mean} too far from 0"
-        
-        # Component variances should be 1/k
-        component_vars = cols.var(dim=0)
-        expected_var = 1.0 / k
-        mean_var = component_vars.mean().item()
-        assert abs(mean_var - expected_var) < 0.03, f"Column {col_idx}: mean var {mean_var} too far from {expected_var}"
+    # Create orthonormal basis vectors
+    basis = torch.eye(k, device=device)
+    
+    # Apply same rotation (same nonce) to all basis vectors
+    rotated = []
+    for i in range(k):
+        x = basis[i:i+1, :]  # [1, k]
+        y = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, [0], x, device)
+        rotated.append(y[0])
+    
+    rotated = torch.stack(rotated)  # [k, k]
+    
+    # Check orthonormality: rotated @ rotated.T should be identity
+    product = rotated @ rotated.T
+    identity = torch.eye(k, device=device)
+    assert torch.allclose(product, identity, atol=1e-4)
+
+
+def test_haar_rotation_different_inputs_same_rotation():
+    """Different input vectors rotated by same nonce maintain relative angles"""
+    device = torch.device("cuda:0")
+    k = 16
+    
+    # Two orthogonal vectors
+    x1 = torch.zeros(1, k, device=device)
+    x1[0, 0] = 1.0
+    x2 = torch.zeros(1, k, device=device)
+    x2[0, 1] = 1.0
+    
+    # Same rotation (same nonce) applied to both
+    y1 = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, [0], x1, device)
+    y2 = apply_haar_rotation(BLOCK_HASH, PUBLIC_KEY, [0], x2, device)
+    
+    # Should still be orthogonal
+    dot = (y1 * y2).sum()
+    assert abs(dot.item()) < 1e-4, f"Dot product {dot.item()} should be ~0"

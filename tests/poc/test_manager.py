@@ -1,10 +1,11 @@
+"""Tests for PoCManager (stateless artifact generation)."""
 import pytest
-import time
+import numpy as np
 import torch
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import MagicMock
 
-from vllm.poc.config import PoCConfig, PoCState
-from vllm.poc.manager import PoCManager, PoCStats
+from vllm.poc.manager import PoCManager
+from vllm.poc.data import decode_vector
 
 
 class MockModelConfig:
@@ -18,12 +19,7 @@ class MockModelConfig:
 
 
 def create_mock_model_executor():
-    """Create a mock model executor with driver_worker.
-    
-    Returns a mock executor that has:
-    - driver_worker.device: torch.device
-    - collective_rpc: Mock that can be configured
-    """
+    """Create a mock model executor with driver_worker."""
     executor = MagicMock()
     executor.driver_worker = MagicMock()
     executor.driver_worker.device = torch.device("cpu")
@@ -32,35 +28,11 @@ def create_mock_model_executor():
 
 
 def create_mock_vllm_config():
-    """Create a mock VllmConfig for testing.
-    
-    The manager uses vllm_config for set_forward_context(), which needs:
-    - compilation_config.static_forward_context: dict of attention layers
-    - parallel_config.data_parallel_size: for DP metadata (we set to 1 to skip)
-    """
+    """Create a mock VllmConfig for testing."""
     vllm_config = MagicMock()
     vllm_config.compilation_config.static_forward_context = {}
     vllm_config.parallel_config.data_parallel_size = 1
     return vllm_config
-
-
-class TestPoCStats:
-    def test_initial_state(self):
-        stats = PoCStats()
-        assert stats.total_checked == 0
-        assert stats.total_valid == 0
-        assert stats.elapsed == 0.0
-        assert stats.rate == 0.0
-    
-    def test_elapsed_calculation(self):
-        stats = PoCStats(total_checked=100, start_time=time.time() - 10)
-        assert stats.elapsed >= 10
-        assert stats.elapsed < 11
-    
-    def test_rate_calculation(self):
-        stats = PoCStats(total_checked=100, start_time=time.time() - 10)
-        assert stats.rate >= 9
-        assert stats.rate <= 11
 
 
 class TestPoCManagerInit:
@@ -77,237 +49,23 @@ class TestPoCManagerInit:
         return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     def test_initial_state(self, manager):
-        assert manager.state == PoCState.IDLE
-        assert manager.config is None
-        assert manager.valid_nonces == []
-        assert manager.valid_distances == []
+        """Test manager initializes correctly (stateless)."""
+        assert manager.model_executor is not None
+        assert manager.model_config is not None
+        assert manager.vllm_config is not None
 
 
-class TestPoCManagerStateTransitions:
-    @pytest.fixture
-    def mock_executor(self):
-        return create_mock_model_executor()
-    
-    @pytest.fixture
-    def mock_vllm_config(self):
-        return create_mock_vllm_config()
-    
-    @pytest.fixture
-    def manager(self, mock_executor, mock_vllm_config):
-        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
-    
-    @pytest.fixture
-    def config(self):
-        return PoCConfig(
-            block_hash="hash1",
-            block_height=100,
-            public_key="node1",
-            r_target=0.5,
-        )
-    
-    def test_init_round_sets_config(self, manager, config):
-        manager.init_round(config)
-        
-        assert manager.state == PoCState.IDLE
-        assert manager.config == config
-    
-    def test_start_generate_sets_state(self, manager, config):
-        manager.init_round(config)
-        
-        manager.start_generate()
-        assert manager.state == PoCState.GENERATING
-    
-    def test_start_validate_sets_state(self, manager, config):
-        manager.init_round(config)
-        
-        manager.start_validate()
-        assert manager.state == PoCState.VALIDATING
-    
-    def test_generating_to_validating_transition(self, manager, config):
-        """Test GENERATING -> VALIDATING transition."""
-        manager.init_round(config)
-        
-        manager.start_generate()
-        assert manager.state == PoCState.GENERATING
-        
-        manager.start_validate()
-        assert manager.state == PoCState.VALIDATING
-    
-    def test_init_round_resets_counters(self, manager, config):
-        manager.valid_nonces = [1, 2, 3]
-        manager.valid_distances = [0.1, 0.2, 0.3]
-        manager.stats.total_checked = 100
-        
-        manager.init_round(config)
-        
-        assert manager.valid_nonces == []
-        assert manager.valid_distances == []
-        assert manager.stats.total_checked == 0
-    
-    def test_init_round_raises_if_already_generating(self, manager, config):
-        manager.init_round(config)
-        manager.start_generate()
-        
-        with pytest.raises(RuntimeError, match="Round already in progress"):
-            manager.init_round(config)
-    
-    def test_start_generate_requires_init(self, manager):
-        with pytest.raises(RuntimeError, match="Round not initialized"):
-            manager.start_generate()
-    
-    def test_start_validate_requires_init(self, manager):
-        with pytest.raises(RuntimeError, match="Round not initialized"):
-            manager.start_validate()
-    
-    def test_stop_round_from_generating(self, manager, config):
-        manager.init_round(config)
-        manager.start_generate()
-        
-        manager.stop_round()
-        assert manager.state == PoCState.STOPPED
-    
-    def test_stop_round_from_validating(self, manager, config):
-        manager.init_round(config)
-        manager.start_validate()
-        
-        manager.stop_round()
-        assert manager.state == PoCState.STOPPED
-
-
-class TestPoCManagerNonceGeneration:
-    """Cross-check: Nonce iteration pattern with original NonceIterator"""
-    
-    @pytest.fixture
-    def mock_executor(self):
-        return create_mock_model_executor()
-    
-    @pytest.fixture
-    def mock_vllm_config(self):
-        return create_mock_vllm_config()
-    
-    @pytest.fixture
-    def manager(self, mock_executor, mock_vllm_config):
-        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
-    
-    def test_single_node_nonces(self, manager):
-        """Single node gets sequential nonces: 0, 1, 2, ..."""
-        config = PoCConfig(
-            block_hash="hash1",
-            block_height=100,
-            public_key="node1",
-            r_target=0.5,
-            node_id=0,
-            node_count=1,
-            batch_size=4,
-        )
-        manager.init_round(config)
-        manager.start_generate()
-        
-        nonces1 = manager.get_next_nonces()
-        assert nonces1 == [0, 1, 2, 3]
-        
-        nonces2 = manager.get_next_nonces()
-        assert nonces2 == [4, 5, 6, 7]
-    
-    def test_multi_node_nonces_node0(self, manager):
-        """Node 0 of 3 gets: 0, 3, 6, 9, ..."""
-        config = PoCConfig(
-            block_hash="hash1",
-            block_height=100,
-            public_key="node1",
-            r_target=0.5,
-            node_id=0,
-            node_count=3,
-            batch_size=4,
-        )
-        manager.init_round(config)
-        manager.start_generate()
-        
-        nonces = manager.get_next_nonces()
-        assert nonces == [0, 3, 6, 9]
-    
-    def test_multi_node_nonces_node1(self, manager):
-        """Node 1 of 3 gets: 1, 4, 7, 10, ..."""
-        config = PoCConfig(
-            block_hash="hash1",
-            block_height=100,
-            public_key="node1",
-            r_target=0.5,
-            node_id=1,
-            node_count=3,
-            batch_size=4,
-        )
-        manager.init_round(config)
-        manager.start_generate()
-        
-        nonces = manager.get_next_nonces()
-        assert nonces == [1, 4, 7, 10]
-    
-    def test_multi_node_nonces_node2(self, manager):
-        """Node 2 of 3 gets: 2, 5, 8, 11, ..."""
-        config = PoCConfig(
-            block_hash="hash1",
-            block_height=100,
-            public_key="node1",
-            r_target=0.5,
-            node_id=2,
-            node_count=3,
-            batch_size=4,
-        )
-        manager.init_round(config)
-        manager.start_generate()
-        
-        nonces = manager.get_next_nonces()
-        assert nonces == [2, 5, 8, 11]
-
-
-class TestPoCManagerStatus:
-    @pytest.fixture
-    def mock_executor(self):
-        return create_mock_model_executor()
-    
-    @pytest.fixture
-    def mock_vllm_config(self):
-        return create_mock_vllm_config()
-    
-    @pytest.fixture
-    def manager(self, mock_executor, mock_vllm_config):
-        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
-    
-    def test_get_status_idle(self, manager):
-        status = manager.get_status()
-        assert status["state"] == "IDLE"
-        assert status["valid_nonces"] == []
-        assert status["valid_distances"] == []
-        assert status["total_checked"] == 0
-        assert status["total_valid"] == 0
-    
-    def test_get_status_with_data(self, manager):
-        manager.valid_nonces = [1, 2, 3]
-        manager.valid_distances = [0.1, 0.2, 0.3]
-        manager.stats.total_checked = 100
-        manager.stats.total_valid = 3
-        
-        status = manager.get_status()
-        assert status["valid_nonces"] == [1, 2, 3]
-        assert status["valid_distances"] == [0.1, 0.2, 0.3]
-        assert status["total_checked"] == 100
-        assert status["total_valid"] == 3
-
-
-class TestPoCManagerBatch:
-    """Test run_batch with mocked collective_rpc."""
+class TestPoCManagerGenerateArtifacts:
+    """Test generate_artifacts with mocked collective_rpc."""
     
     @pytest.fixture
     def mock_executor(self):
         executor = create_mock_model_executor()
-        # Configure collective_rpc to return a result from "last PP rank"
+        # Configure collective_rpc to return artifacts from "last PP rank"
+        vectors = np.random.randn(4, 12).astype(np.float16)
         executor.collective_rpc.return_value = [
-            None,  # First PP rank
-            {  # Last PP rank
-                "nonces": [0, 1, 2, 3],
-                "distances": [0.1, 0.2, 0.3, 0.4],
-            }
+            None,  # Other ranks
+            {"nonces": [0, 1, 2, 3], "vectors": vectors},  # Last PP rank
         ]
         return executor
     
@@ -319,136 +77,94 @@ class TestPoCManagerBatch:
     def manager(self, mock_executor, mock_vllm_config):
         return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
-    def test_run_batch_calls_collective_rpc(self, manager, mock_executor):
-        """run_batch should call collective_rpc with execute_poc_forward."""
-        config = PoCConfig(
-            block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
-            batch_size=4,
-            seq_len=32,
+    def test_generate_artifacts_returns_artifacts(self, manager, mock_executor):
+        """Test generate_artifacts returns artifacts list."""
+        artifacts = manager.generate_artifacts(
+            nonces=[0, 1, 2, 3],
+            block_hash="hash1",
+            public_key="node1",
+            seq_len=256,
+            k_dim=12,
         )
-        manager.init_round(config)
-        manager.start_generate()
         
-        batch = manager.run_batch()
+        assert len(artifacts) == 4
+        assert artifacts[0].nonce == 0
+        assert artifacts[3].nonce == 3
         
-        # Verify collective_rpc was called (once for forward)
-        assert mock_executor.collective_rpc.call_count == 1
-        # Call should be execute_poc_forward
-        from vllm.poc.poc_model_runner import execute_poc_forward
-        last_call = mock_executor.collective_rpc.call_args_list[-1]
-        assert last_call[0][0] == execute_poc_forward
-        
-        # Verify batch data
-        assert batch.nonces == [0, 1, 2, 3]
-        assert batch.dist == [0.1, 0.2, 0.3, 0.4]
+        # Verify collective_rpc was called
+        mock_executor.collective_rpc.assert_called_once()
     
-    def test_run_batch_updates_stats(self, manager, mock_executor):
-        """run_batch should update stats."""
-        config = PoCConfig(
-            block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
-            batch_size=4,
-            seq_len=32,
+    def test_generate_artifacts_encodes_vectors(self, manager, mock_executor):
+        """Test that vectors are properly encoded to base64."""
+        artifacts = manager.generate_artifacts(
+            nonces=[0, 1],
+            block_hash="hash1",
+            public_key="node1",
+            seq_len=256,
+            k_dim=12,
         )
-        manager.init_round(config)
-        manager.start_generate()
         
-        assert manager.stats.total_checked == 0
-        
-        manager.run_batch()
-        
-        assert manager.stats.total_checked == 4
+        # Should be able to decode vectors back
+        for artifact in artifacts:
+            vector = decode_vector(artifact.vector_b64)
+            assert len(vector) == 12  # k_dim
+            assert vector.dtype == np.float32  # decode returns float32
     
-    def test_run_batch_tracks_valid_nonces(self, manager, mock_executor):
-        """run_batch should track valid nonces (d < r_target)."""
-        # Set r_target so some are valid
-        config = PoCConfig(
-            block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.25,  # First two will be valid (0.1, 0.2)
-            batch_size=4,
-            seq_len=32,
+    def test_generate_artifacts_empty_when_no_result(self, manager, mock_executor):
+        """Test generate_artifacts returns empty list when forward returns None."""
+        mock_executor.collective_rpc.return_value = [None, None]
+        
+        artifacts = manager.generate_artifacts(
+            nonces=[0, 1],
+            block_hash="hash1",
+            public_key="node1",
+            seq_len=256,
+            k_dim=12,
         )
-        manager.init_round(config)
-        manager.start_generate()
         
-        manager.run_batch()
-        
-        assert manager.valid_nonces == [0, 1]
-        assert manager.valid_distances == [0.1, 0.2]
-        assert manager.stats.total_valid == 2
+        assert artifacts == []
     
-    def test_run_batch_returns_empty_when_not_generating(self, manager):
-        """run_batch returns empty batch if not in GENERATING state."""
-        config = PoCConfig(
+    def test_generate_artifacts_passes_correct_args(self, manager, mock_executor):
+        """Test that generate_artifacts passes correct args to collective_rpc."""
+        manager.generate_artifacts(
+            nonces=[10, 20, 30],
             block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
+            public_key="test_pubkey",
+            seq_len=512,
+            k_dim=16,
         )
-        manager.init_round(config)
-        # Don't call start_generate()
         
-        batch = manager.run_batch()
+        # Verify the args passed to collective_rpc
+        call_args = mock_executor.collective_rpc.call_args
+        assert call_args is not None
         
-        assert len(batch) == 0
-    
-    def test_run_batch_with_state_returns_full_result(self, manager, mock_executor):
-        """run_batch_with_state returns batch + state for optimized loop."""
-        config = PoCConfig(
-            block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.25,  # First two will be valid
-            batch_size=4,
-            seq_len=32,
-            node_id=0,
-        )
-        manager.init_round(config)
-        manager.start_generate()
+        # First positional arg is the function
+        # args= tuple contains the actual arguments
+        args_tuple = call_args.kwargs.get('args') or call_args[1].get('args')
+        if args_tuple is None:
+            args_tuple = call_args[0][1] if len(call_args[0]) > 1 else call_args.kwargs.get('args', ())
         
-        result = manager.run_batch_with_state()
-        
-        assert result["should_continue"] is True
-        assert result["state"] == "GENERATING"
-        assert result["public_key"] == "test_node"
-        assert result["block_hash"] == "test_hash"
-        assert result["block_height"] == 100
-        assert result["node_id"] == 0
-        assert result["nonces"] == [0, 1, 2, 3]
-        assert result["distances"] == [0.1, 0.2, 0.3, 0.4]
-        assert result["valid_nonces"] == [0, 1]  # d < 0.25
-        assert result["valid_distances"] == [0.1, 0.2]
-    
-    def test_run_batch_with_state_returns_false_when_not_generating(self, manager):
-        """run_batch_with_state returns should_continue=False when not generating."""
-        config = PoCConfig(
-            block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
-        )
-        manager.init_round(config)
-        # Don't call start_generate()
-        
-        result = manager.run_batch_with_state()
-        
-        assert result["should_continue"] is False
-        assert result["state"] == "IDLE"
+        # The args should include block_hash, public_key, nonces, seq_len, hidden_size, k_dim
+        # Order: (block_hash, public_key, nonces, seq_len, hidden_size, k_dim)
+        assert "test_hash" in str(args_tuple)
+        assert "test_pubkey" in str(args_tuple)
 
 
-class TestPoCManagerValidate:
-    """Test validate with mocked collective_rpc."""
+class TestPoCManagerStateless:
+    """Test that PoCManager is stateless."""
     
     @pytest.fixture
     def mock_executor(self):
         executor = create_mock_model_executor()
+        # Return dynamic nonces based on what was passed
+        def mock_collective_rpc(func, args=None, **kwargs):
+            if args:
+                # args = (block_hash, public_key, nonces, seq_len, hidden_size, k_dim)
+                nonces = args[2] if len(args) > 2 else [0, 1]
+                vectors = np.random.randn(len(nonces), 12).astype(np.float16)
+                return [{"nonces": nonces, "vectors": vectors}]
+            return [None]
+        executor.collective_rpc.side_effect = mock_collective_rpc
         return executor
     
     @pytest.fixture
@@ -459,56 +175,28 @@ class TestPoCManagerValidate:
     def manager(self, mock_executor, mock_vllm_config):
         return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
-    def test_validate_calls_collective_rpc(self, manager, mock_executor):
-        """validate should call collective_rpc with execute_poc_forward."""
-        mock_executor.collective_rpc.return_value = [
-            None,
-            {
-                "nonces": [0, 1, 2],
-                "distances": [0.1, 0.6, 0.2],
-            }
-        ]
-        
-        config = PoCConfig(
-            block_hash="test_hash",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
+    def test_no_state_between_calls(self, manager):
+        """Test that manager doesn't maintain state between generate_artifacts calls."""
+        # First call
+        artifacts1 = manager.generate_artifacts(
+            nonces=[0, 1],
+            block_hash="hash1",
+            public_key="node1",
+            seq_len=256,
+            k_dim=12,
         )
-        manager.init_round(config)
-        manager.start_validate()
         
-        result = manager.validate([0, 1, 2], "test_node")
+        # Second call with different params
+        artifacts2 = manager.generate_artifacts(
+            nonces=[100, 101],
+            block_hash="hash2",
+            public_key="node2",
+            seq_len=512,
+            k_dim=16,
+        )
         
-        # Verify collective_rpc was called (once for forward)
-        assert mock_executor.collective_rpc.call_count == 1
-        # Call should be execute_poc_forward
-        from vllm.poc.poc_model_runner import execute_poc_forward
-        last_call = mock_executor.collective_rpc.call_args_list[-1]
-        assert last_call[0][0] == execute_poc_forward
-        
-        # Verify results (validate computes valid flags from distances)
-        assert result["computed_distances"] == [0.1, 0.6, 0.2]
-        assert result["valid"] == [True, False, True]
-    
-    def test_validate_requires_config(self, manager):
-        """validate raises error if no round configured."""
-        with pytest.raises(RuntimeError, match="No round configured"):
-            manager.validate([0, 1, 2], "test_node")
-
-
-# GPU Tests - require CUDA and load actual model
-# These tests are skipped because running the model outside the worker
-# context causes parallel group initialization errors. Proper GPU tests
-# should be done in Phase 5 E2E tests where the full vLLM server runs.
-@pytest.mark.gpu
-@pytest.mark.skip(reason="GPU tests require full worker context - deferred to Phase 5 E2E tests")
-class TestPoCManagerGPU:
-    """GPU tests that load a real model to test run_batch and validate.
-    
-    WARNING: These tests are currently skipped because:
-    - The model needs to run inside the vLLM worker process context
-    - Extracting the model and running it directly causes parallel group errors
-    - Proper testing should be done in Phase 5 with full E2E integration tests
-    """
-    pass
+        # Both should succeed independently
+        assert len(artifacts1) == 2
+        assert len(artifacts2) == 2
+        assert artifacts1[0].nonce == 0
+        assert artifacts2[0].nonce == 100
