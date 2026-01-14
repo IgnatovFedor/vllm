@@ -780,6 +780,41 @@ class AsyncLLM(EngineClient):
             manager.teardown_generate_hooks()
             return {"status": "ok"}
 
+        elif action == "generate_artifacts":
+            # Coexistence checks: skip PoC GPU work if chat is busy
+            # 1. Check for pending input (requests in scheduler)
+            # For InprocClient, scheduler is accessible via engine_core.engine_core
+            # For MPClient, we check dp_engines_running instead
+            if hasattr(self.engine_core, 'engine_core') and hasattr(self.engine_core.engine_core, 'scheduler'):
+                # InprocClient mode - check scheduler directly
+                if self.engine_core.engine_core.scheduler.has_requests():
+                    return {"skipped": True, "reason": "pending_input", "artifacts": []}
+            elif hasattr(self.engine_core, 'dp_engines_running'):
+                # MPClient mode - check if engines are running (indicates pending work or step in progress)
+                if self.engine_core.dp_engines_running():
+                    return {"skipped": True, "reason": "engine_step_in_progress", "artifacts": []}
+            
+            # 2. Check for unfinished chat requests
+            if self.processor.has_unfinished_requests():
+                return {"skipped": True, "reason": "chat_unfinished", "artifacts": []}
+            
+            # All checks passed, proceed with generation
+            artifacts = manager.generate_artifacts(
+                nonces=payload.get("nonces", []),
+                block_hash=payload.get("block_hash", ""),
+                public_key=payload.get("public_key", ""),
+                seq_len=payload.get("seq_len", 256),
+                k_dim=payload.get("k_dim", 12),
+            )
+            
+            # Convert artifacts to dict format
+            return {
+                "artifacts": [
+                    {"nonce": a.nonce, "vector_b64": a.vector_b64}
+                    for a in artifacts
+                ]
+            }
+
         else:
             raise ValueError(f"Unknown PoC action: {action}")
 

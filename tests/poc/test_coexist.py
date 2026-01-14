@@ -1,15 +1,11 @@
 """Tests for PoC+Chat coexistence (chat-priority gating)."""
-import pytest
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
-from vllm.poc.routes import (
-    router, _generation_loop, _get_next_nonces,
-    POC_CHAT_BUSY_BACKOFF_SEC,
-)
-from vllm.poc.config import PoCState
+import pytest
+
+from vllm.poc.routes import _generation_loop, _get_next_nonces
 
 
 @pytest.fixture
@@ -26,98 +22,114 @@ def mock_engine_client():
 class TestChatPriorityGating:
     """Tests for chat-priority gating in PoC GPU actions."""
     
-    def test_generate_artifacts_skips_when_pending_input(self):
+    @pytest.mark.asyncio
+    async def test_generate_artifacts_skips_when_pending_input(self):
         """Test generate_artifacts returns skip when there's pending input (chat waiting)."""
-        from vllm.engine.multiprocessing.engine import MQLLMEngine
+        from vllm.v1.engine.async_llm import AsyncLLM
         
-        mock_llm_engine = MagicMock()
+        # Build a minimal, real-ish engine_core structure (no MagicMock nesting)
+        scheduler = SimpleNamespace()
+        scheduler.has_requests = lambda: True  # Pending input
+        inner_core = SimpleNamespace(scheduler=scheduler)
+        engine_core = SimpleNamespace(engine_core=inner_core)
         
-        mq_engine = MagicMock()
-        mq_engine.engine = mock_llm_engine
-        mq_engine._engine_step_in_progress = False
-        mq_engine.input_socket.poll.return_value = 1  # Pending input
+        processor = SimpleNamespace()
+        processor.has_unfinished_requests = lambda: False
         
-        mock_manager = MagicMock()
-        mq_engine._poc_manager = mock_manager
-        mq_engine._get_poc_manager = lambda: mock_manager
+        async_llm = SimpleNamespace(
+            engine_core=engine_core,
+            processor=processor,
+            _poc_manager=MagicMock(),
+        )
         
-        result = MQLLMEngine._process_poc_action(mq_engine, "generate_artifacts", {
+        result = await AsyncLLM.poc_request(async_llm, "generate_artifacts", {
             "nonces": [0, 1, 2],
         })
         
         assert result["skipped"] is True
         assert result["reason"] == "pending_input"
-        mock_manager.generate_artifacts.assert_not_called()
+        async_llm._poc_manager.generate_artifacts.assert_not_called()
     
-    def test_generate_artifacts_skips_when_engine_step_in_progress(self):
-        """Test generate_artifacts returns skip when _engine_step_in_progress is True."""
-        from vllm.engine.multiprocessing.engine import MQLLMEngine
+    @pytest.mark.asyncio
+    async def test_generate_artifacts_skips_when_engine_step_in_progress(self):
+        """Test generate_artifacts returns skip when engine step is in progress."""
+        from vllm.v1.engine.async_llm import AsyncLLM
         
-        mock_llm_engine = MagicMock()
+        # MPClient-like: only dp_engines_running, no inner engine_core
+        engine_core = SimpleNamespace(
+            dp_engines_running=lambda: True,
+        )
+        processor = SimpleNamespace()
+        processor.has_unfinished_requests = lambda: False
         
-        mq_engine = MagicMock()
-        mq_engine.engine = mock_llm_engine
-        mq_engine._engine_step_in_progress = True
-        mq_engine.input_socket.poll.return_value = 0  # No pending input
+        async_llm = SimpleNamespace(
+            engine_core=engine_core,
+            processor=processor,
+            _poc_manager=MagicMock(),
+        )
         
-        mock_manager = MagicMock()
-        mq_engine._poc_manager = mock_manager
-        mq_engine._get_poc_manager = lambda: mock_manager
-        
-        result = MQLLMEngine._process_poc_action(mq_engine, "generate_artifacts", {
+        result = await AsyncLLM.poc_request(async_llm, "generate_artifacts", {
             "nonces": [0, 1, 2],
         })
         
         assert result["skipped"] is True
         assert result["reason"] == "engine_step_in_progress"
-        mock_manager.generate_artifacts.assert_not_called()
+        async_llm._poc_manager.generate_artifacts.assert_not_called()
     
-    def test_generate_artifacts_skips_when_chat_unfinished(self):
+    @pytest.mark.asyncio
+    async def test_generate_artifacts_skips_when_chat_unfinished(self):
         """Test generate_artifacts returns skip when chat has unfinished requests."""
-        from vllm.engine.multiprocessing.engine import MQLLMEngine
+        from vllm.v1.engine.async_llm import AsyncLLM
         
-        mock_llm_engine = MagicMock()
-        mock_llm_engine.has_unfinished_requests.return_value = True
+        scheduler = SimpleNamespace()
+        scheduler.has_requests = lambda: False  # No pending input
+        inner_core = SimpleNamespace(scheduler=scheduler)
+        engine_core = SimpleNamespace(engine_core=inner_core)
         
-        mq_engine = MagicMock()
-        mq_engine.engine = mock_llm_engine
-        mq_engine._engine_step_in_progress = False
-        mq_engine.input_socket.poll.return_value = 0  # No pending input
+        processor = SimpleNamespace()
+        processor.has_unfinished_requests = lambda: True  # Chat unfinished
         
-        mock_manager = MagicMock()
-        mq_engine._poc_manager = mock_manager
-        mq_engine._get_poc_manager = lambda: mock_manager
+        async_llm = SimpleNamespace(
+            engine_core=engine_core,
+            processor=processor,
+            _poc_manager=MagicMock(),
+        )
         
-        result = MQLLMEngine._process_poc_action(mq_engine, "generate_artifacts", {
+        result = await AsyncLLM.poc_request(async_llm, "generate_artifacts", {
             "nonces": [0, 1, 2],
         })
         
         assert result["skipped"] is True
         assert result["reason"] == "chat_unfinished"
-        mock_manager.generate_artifacts.assert_not_called()
+        async_llm._poc_manager.generate_artifacts.assert_not_called()
     
-    def test_generate_artifacts_proceeds_when_all_checks_pass(self):
+    @pytest.mark.asyncio
+    async def test_generate_artifacts_proceeds_when_all_checks_pass(self):
         """Test generate_artifacts proceeds when no pending input, not in step, and no chat."""
-        from vllm.engine.multiprocessing.engine import MQLLMEngine
+        from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.poc.data import Artifact
         
-        mock_llm_engine = MagicMock()
-        mock_llm_engine.has_unfinished_requests.return_value = False
+        scheduler = SimpleNamespace()
+        scheduler.has_requests = lambda: False  # No pending input
+        inner_core = SimpleNamespace(scheduler=scheduler)
+        engine_core = SimpleNamespace(engine_core=inner_core)
         
-        mq_engine = MagicMock()
-        mq_engine.engine = mock_llm_engine
-        mq_engine._engine_step_in_progress = False
-        mq_engine.input_socket.poll.return_value = 0  # No pending input
+        processor = SimpleNamespace()
+        processor.has_unfinished_requests = lambda: False
         
         mock_manager = MagicMock()
         mock_manager.generate_artifacts.return_value = [
             Artifact(nonce=0, vector_b64="AAA="),
             Artifact(nonce=1, vector_b64="BBB="),
         ]
-        mq_engine._poc_manager = mock_manager
-        mq_engine._get_poc_manager = lambda: mock_manager
         
-        result = MQLLMEngine._process_poc_action(mq_engine, "generate_artifacts", {
+        async_llm = SimpleNamespace(
+            engine_core=engine_core,
+            processor=processor,
+            _poc_manager=mock_manager,
+        )
+        
+        result = await AsyncLLM.poc_request(async_llm, "generate_artifacts", {
             "nonces": [0, 1],
             "block_hash": "hash",
             "public_key": "key",
@@ -125,16 +137,9 @@ class TestChatPriorityGating:
             "k_dim": 12,
         })
         
-        # Should call _prepare_for_poc_gpu_work before generate_artifacts
-        mq_engine._prepare_for_poc_gpu_work.assert_called_once()
         mock_manager.generate_artifacts.assert_called_once()
         assert "skipped" not in result or result.get("skipped") is not True
         assert len(result["artifacts"]) == 2
-
-
-# Note: AsyncLLMEngine (in-process mode) tests are skipped because _AsyncLLMEngine
-# is difficult to mock correctly due to class proxy behavior at module load time.
-# The main PoC behavior is tested via MQLLMEngine (MP mode) tests above.
 
 
 class TestGenerationLoopBackoff:
@@ -221,27 +226,12 @@ class TestNonceGeneration:
 class TestUnknownAction:
     """Tests for unknown action handling."""
     
-    def test_mp_engine_rejects_unknown_action(self):
-        """Test MP engine rejects unknown actions."""
-        from vllm.engine.multiprocessing.engine import MQLLMEngine
+    @pytest.mark.asyncio
+    async def test_v1_engine_rejects_unknown_action(self):
+        """Test v1 AsyncLLM rejects unknown actions."""
+        from vllm.v1.engine.async_llm import AsyncLLM
         
-        mq_engine = MagicMock()
-        mq_engine._get_poc_manager = MagicMock()
+        async_llm = MagicMock()
         
         with pytest.raises(ValueError, match="Unknown PoC action"):
-            MQLLMEngine._process_poc_action(mq_engine, "unknown_action", {})
-    
-    def test_mp_engine_rejects_old_actions(self):
-        """Test MP engine rejects old actions like run_batch, init, etc."""
-        from vllm.engine.multiprocessing.engine import MQLLMEngine
-        
-        mq_engine = MagicMock()
-        mq_engine._get_poc_manager = MagicMock()
-        
-        for old_action in ["init", "start_generate", "stop", "status", "run_batch"]:
-            with pytest.raises(ValueError, match="Unknown PoC action"):
-                MQLLMEngine._process_poc_action(mq_engine, old_action, {})
-    
-    # Note: async_engine_rejects_unknown_action test is skipped because
-    # _AsyncLLMEngine is difficult to mock correctly. The behavior is
-    # covered by the MP engine test above.
+            await AsyncLLM.poc_request(async_llm, "unknown_action", {})
