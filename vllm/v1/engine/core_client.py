@@ -249,6 +249,11 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def poc_request_async(
+        self, action: str, payload: dict, timeout_ms: int | None = None
+    ) -> dict:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -327,6 +332,14 @@ class InprocClient(EngineCoreClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    async def poc_request_async(
+        self, action: str, payload: dict, timeout_ms: int | None = None
+    ) -> dict:
+        """PoC request for InprocClient - delegates to EngineCore directly."""
+        # InprocClient runs in same process, so we can call directly
+        # timeout_ms is ignored since it's synchronous
+        return self.engine_core.poc_request(action, payload)
 
     def dp_engines_running(self) -> bool:
         return False
@@ -997,6 +1010,35 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    async def poc_request_async(
+        self, action: str, payload: dict, timeout_ms: int | None = None
+    ) -> dict:
+        """Send a PoC request to the EngineCore with optional timeout.
+
+        Args:
+            action: The PoC action ("generate_artifacts", etc.)
+            payload: Action-specific data
+            timeout_ms: Optional timeout in milliseconds
+
+        Returns:
+            Result dictionary from EngineCore
+
+        Raises:
+            TimeoutError: If the request times out
+        """
+        coro = self.call_utility_async("poc_request", action, payload)
+
+        if timeout_ms is not None and timeout_ms > 0:
+            timeout_sec = timeout_ms / 1000.0
+            try:
+                return await asyncio.wait_for(coro, timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"PoC request '{action}' timed out after {timeout_ms}ms"
+                )
+        else:
+            return await coro
 
 
 class DPAsyncMPClient(AsyncMPClient):

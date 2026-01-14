@@ -708,115 +708,37 @@ class AsyncLLM(EngineClient):
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
-    async def poc_request(self, action: str, payload: dict) -> dict:
+    async def poc_request(self, action: str, payload: dict,
+                          timeout_ms: int | None = None) -> dict:
         """Send a PoC (Proof of Compute) request to the engine.
 
-        For AsyncLLMEngine (non-multiprocessing mode), we directly
-        create and use a PoCManager.
+        Delegates to EngineCore via async utility call. The PoCManager lives
+        in the EngineCore process to avoid blocking the API server event loop.
+
+        Args:
+            action: The PoC action to perform ("generate_artifacts", etc.)
+            payload: Action-specific data
+            timeout_ms: Optional timeout in milliseconds
+
+        Returns:
+            Result dictionary from the engine
+
+        Raises:
+            TimeoutError: If the request times out
         """
-        if not hasattr(self, '_poc_manager'):
-            from vllm.poc.manager import PoCManager
-            self._poc_manager = PoCManager(
-                model_executor=self.engine_core,
-                model_config=self.model_config,
-                vllm_config=self.vllm_config,
-            )
+        if action == "generate_artifacts":
+            # Client-side coexistence check: unfinished requests in output processor
+            # (EngineCore checks scheduler.has_requests() on its side)
+            if self.output_processor.has_unfinished_requests():
+                return {"skipped": True, "reason": "chat_unfinished", "artifacts": []}
 
-        manager = self._poc_manager
-
-        if action == "init":
-            from vllm.poc.config import PoCConfig
-            config = PoCConfig(**payload)
-            manager.init_round(config)
-            return {"status": "initialized", "pow_status": manager.get_status()}
-
-        elif action == "start_generate":
-            manager.start_generate()
-            return {"status": "generating", "pow_status": manager.get_status()}
-
-        elif action == "start_validate":
-            manager.start_validate()
-            return {"status": "validating", "pow_status": manager.get_status()}
-
-        elif action == "stop":
-            manager.stop_round()
-            return {"status": "stopped", "pow_status": manager.get_status()}
-
-        elif action == "status":
-            return manager.get_status()
-
-        elif action == "run_batch":
-            batch = manager.run_batch()
-            return {
-                "nonces": batch.nonces,
-                "distances": batch.dist,
-                "pow_status": manager.get_status(),
-            }
-
-        elif action == "run_batch_with_state":
-            return manager.run_batch_with_state()
-
-        elif action == "validate":
-            nonces = payload.get("nonces", [])
-            public_key = payload.get("public_key", "")
-            distances, valid = manager.validate(nonces, public_key)
-            return {
-                "nonces": nonces,
-                "distances": distances,
-                "valid": valid,
-            }
-
-        elif action == "generate_for_nonces":
-            return manager.generate_for_nonces(
-                nonces=payload.get("nonces", []),
-                block_hash=payload.get("block_hash", ""),
-                public_key=payload.get("public_key", ""),
-                r_target=payload.get("r_target", 0.5),
-                seq_len=payload.get("seq_len", 256),
-                return_vectors=payload.get("return_vectors", False),
-            )
-
-        elif action == "teardown_generate_hooks":
-            manager.teardown_generate_hooks()
-            return {"status": "ok"}
-
-        elif action == "generate_artifacts":
-            # Coexistence checks: skip PoC GPU work if chat is busy
-            # 1. Check for pending input (requests in scheduler)
-            # For InprocClient, scheduler is accessible via engine_core.engine_core
-            # For MPClient, we check dp_engines_running instead
-            if hasattr(self.engine_core, 'engine_core') and hasattr(self.engine_core.engine_core, 'scheduler'):
-                # InprocClient mode - check scheduler directly
-                if self.engine_core.engine_core.scheduler.has_requests():
-                    return {"skipped": True, "reason": "pending_input", "artifacts": []}
-            elif hasattr(self.engine_core, 'dp_engines_running'):
-                # MPClient mode - check if engines are running (indicates pending work or step in progress)
+            # Also check if DP engines are running (MPClient mode)
+            if hasattr(self.engine_core, 'dp_engines_running'):
                 if self.engine_core.dp_engines_running():
                     return {"skipped": True, "reason": "engine_step_in_progress", "artifacts": []}
-            
-            # 2. Check for unfinished chat requests
-            if self.processor.has_unfinished_requests():
-                return {"skipped": True, "reason": "chat_unfinished", "artifacts": []}
-            
-            # All checks passed, proceed with generation
-            artifacts = manager.generate_artifacts(
-                nonces=payload.get("nonces", []),
-                block_hash=payload.get("block_hash", ""),
-                public_key=payload.get("public_key", ""),
-                seq_len=payload.get("seq_len", 256),
-                k_dim=payload.get("k_dim", 12),
-            )
-            
-            # Convert artifacts to dict format
-            return {
-                "artifacts": [
-                    {"nonce": a.nonce, "vector_b64": a.vector_b64}
-                    for a in artifacts
-                ]
-            }
 
-        else:
-            raise ValueError(f"Unknown PoC action: {action}")
+        # Delegate to EngineCore via async utility call
+        return await self.engine_core.poc_request_async(action, payload, timeout_ms)
 
     async def collective_rpc(
         self,

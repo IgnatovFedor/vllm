@@ -170,13 +170,15 @@ class EngineClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def poc_request(self, action: str, payload: dict) -> dict:
+    async def poc_request(self, action: str, payload: dict,
+                          timeout_ms: int | None = None) -> dict:
         """Send a PoC (Proof of Compute) request to the engine.
 
         Args:
             action: The PoC action to perform ("init", "start_generate",
                    "start_validate", "stop", "status", "run_batch", "validate")
             payload: Action-specific data
+            timeout_ms: Optional timeout in milliseconds
 
         Returns:
             Result dictionary from the engine

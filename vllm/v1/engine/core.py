@@ -538,6 +538,55 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def poc_request(self, action: str, payload: dict) -> dict:
+        """Handle PoC (Proof of Compute) request.
+
+        This method is called via utility RPC from the client. The PoCManager
+        is created lazily and lives in the EngineCore process.
+
+        Args:
+            action: The PoC action ("generate_artifacts", etc.)
+            payload: Action-specific data
+
+        Returns:
+            Result dictionary
+        """
+        if not hasattr(self, '_poc_manager'):
+            from vllm.poc.manager import PoCManager
+            self._poc_manager = PoCManager(
+                model_executor=self.model_executor,
+                model_config=self.vllm_config.model_config,
+                vllm_config=self.vllm_config,
+            )
+
+        manager = self._poc_manager
+
+        if action == "generate_artifacts":
+            # Check if scheduler has pending requests (chat priority)
+            if self.scheduler.has_requests():
+                return {"skipped": True, "reason": "pending_input", "artifacts": []}
+
+            artifacts = manager.generate_artifacts(
+                nonces=payload.get("nonces", []),
+                block_hash=payload.get("block_hash", ""),
+                public_key=payload.get("public_key", ""),
+                seq_len=payload.get("seq_len", 256),
+                k_dim=payload.get("k_dim", 12),
+            )
+
+            return {
+                "artifacts": [
+                    {"nonce": a.nonce, "vector_b64": a.vector_b64}
+                    for a in artifacts
+                ]
+            }
+
+        elif action == "status":
+            return {"scheduler_has_requests": self.scheduler.has_requests()}
+
+        else:
+            raise ValueError(f"Unknown PoC action: {action}")
+
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 
