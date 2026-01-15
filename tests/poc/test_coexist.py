@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from vllm.poc.routes import _generation_loop, _get_next_nonces
+from vllm.poc.routes import _generation_loop
 
 
 @pytest.fixture
@@ -149,41 +149,39 @@ class TestChatPriorityGating:
 
 class TestGenerationLoopBackoff:
     """Tests for generation loop backoff behavior."""
-    
+
     @pytest.mark.asyncio
     async def test_generation_loop_backs_off_on_skip(self, mock_engine_client):
         """Test that generation loop backs off when engine returns skipped."""
         stop_event = asyncio.Event()
-        artifact_queue = asyncio.Queue()
         config = {
             "block_hash": "hash",
             "block_height": 100,
             "public_key": "key",
             "node_id": 0,
             "node_count": 1,
+            "group_id": 0,
+            "n_groups": 1,
             "batch_size": 4,
             "seq_len": 256,
             "k_dim": 12,
         }
         stats = {"start_time": 0, "total_processed": 0}
-        
-        # Return skipped twice, then cancel
+
         call_count = 0
         async def mock_poc_request(action, payload, timeout_ms=None):
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
                 return {"skipped": True, "artifacts": []}
-            # Stop after 2 skips
             stop_event.set()
             return {"artifacts": [], "skipped": True}
-        
+
         mock_engine_client.poc_request = mock_poc_request
-        
-        # Run the loop briefly
+
         with patch('vllm.poc.routes.POC_CHAT_BUSY_BACKOFF_SEC', 0.001):
             task = asyncio.create_task(
-                _generation_loop(mock_engine_client, stop_event, artifact_queue, config, stats)
+                _generation_loop(mock_engine_client, stop_event, None, config, stats)
             )
             await asyncio.sleep(0.1)
             stop_event.set()
@@ -191,41 +189,8 @@ class TestGenerationLoopBackoff:
                 await asyncio.wait_for(task, timeout=1.0)
             except asyncio.CancelledError:
                 pass
-        
-        # Should have called poc_request multiple times due to backoff retries
+
         assert call_count >= 2
-
-
-class TestNonceGeneration:
-    """Tests for API-side nonce generation."""
-    
-    def test_single_node_nonces(self):
-        """Single node gets sequential nonces: 0, 1, 2, ..."""
-        nonces, counter = _get_next_nonces(nonce_counter=0, batch_size=4, node_count=1)
-        assert nonces == [0, 1, 2, 3]
-        assert counter == 4
-        
-        nonces2, counter2 = _get_next_nonces(nonce_counter=counter, batch_size=4, node_count=1)
-        assert nonces2 == [4, 5, 6, 7]
-        assert counter2 == 8
-    
-    def test_multi_node_nonces_node0(self):
-        """Node 0 of 3 gets: 0, 3, 6, 9, ..."""
-        nonces, counter = _get_next_nonces(nonce_counter=0, batch_size=4, node_count=3)
-        assert nonces == [0, 3, 6, 9]
-        assert counter == 12
-    
-    def test_multi_node_nonces_node1(self):
-        """Node 1 of 3 gets: 1, 4, 7, 10, ..."""
-        nonces, counter = _get_next_nonces(nonce_counter=1, batch_size=4, node_count=3)
-        assert nonces == [1, 4, 7, 10]
-        assert counter == 13
-    
-    def test_multi_node_nonces_node2(self):
-        """Node 2 of 3 gets: 2, 5, 8, 11, ..."""
-        nonces, counter = _get_next_nonces(nonce_counter=2, batch_size=4, node_count=3)
-        assert nonces == [2, 5, 8, 11]
-        assert counter == 14
 
 
 class TestUnknownAction:
