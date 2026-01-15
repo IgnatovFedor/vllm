@@ -9,7 +9,7 @@ from typing import List
 
 import torch
 
-from .gpu_random import generate_householder_vector, apply_householder
+from vllm.poc.gpu_random import generate_householder_vector, apply_householder
 
 # Context variable for conditional hook activation
 # Default False means hooks pass through unchanged (for inference)
