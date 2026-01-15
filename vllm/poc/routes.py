@@ -1,297 +1,33 @@
-"""PoC (Proof of Compute) API routes for vLLM server.
-
-Implements artifact-based PoC protocol per production-phase-1.md.
-All PoC state (generation loop, nonce counter, stats, generate queue) is managed here.
-The engine only provides a single stateless operation: generate_artifacts.
-"""
+"""PoC API routes for vLLM server."""
 import asyncio
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-import aiohttp
-import numpy as np
 from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from vllm.logger import init_logger
 from .config import PoCState
-from .data import (
-    Artifact, decode_vector, fraud_test,
-    DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD,
-)
+from .data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD, pad_nonces, filter_artifacts
+from .callbacks import CallbackSender
+from .generate_queue import GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
+from .validation import run_validation
 
 logger = init_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
-# Callback interval for /init/generate (seconds)
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
-
-# Per-chunk timeout for /generate endpoint when engine is busy (seconds)
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
-
-# Backoff sleep when PoC is skipped due to chat being busy (seconds)
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
-
-# Timeout for generate_artifacts RPC during coexistence (ms)
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
+POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
+POC_MIN_BATCH_SIZE = 3
 
-# Result TTL for /generate queue results (seconds)
-GENERATE_RESULT_TTL_SEC = float(os.environ.get("POC_GENERATE_RESULT_TTL_SEC", "300"))
-
-# Module-level state: tracks active generation tasks per app
-# Key: app_id, Value: dict with gen_task, send_task, stop_event, queue, config, stats
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
-
-
-# =============================================================================
-# Generate Queue Infrastructure
-# =============================================================================
-
-@dataclass
-class GenerateJob:
-    """A queued /generate request."""
-    request_id: str
-    engine_client: Any  # Reference to engine client
-    app_id: int
-    block_hash: str
-    block_height: int
-    public_key: str
-    node_id: int
-    node_count: int
-    nonces: List[int]
-    seq_len: int
-    k_dim: int
-    batch_size: int
-    validation_artifacts: Optional[Dict[int, str]] = None  # nonce -> vector_b64
-    stat_test_dist_threshold: float = DEFAULT_DIST_THRESHOLD
-    stat_test_p_mismatch: float = DEFAULT_P_MISMATCH
-    stat_test_fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
-    callback_url: Optional[str] = None
-    created_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class GenerateResult:
-    """Result record for a queued /generate request."""
-    status: str  # "queued", "running", "completed", "failed"
-    created_at: float = field(default_factory=time.time)
-    completed_at: Optional[float] = None
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-
-
-# Module-level queue infrastructure
-_generate_queue: asyncio.Queue = None  # Lazy init
-_generate_results: Dict[str, GenerateResult] = {}
-_generate_worker_task: Optional[asyncio.Task] = None
-_generate_lock: asyncio.Lock = None  # Lazy init
-
-
-def _ensure_queue_initialized():
-    """Lazily initialize queue infrastructure."""
-    global _generate_queue, _generate_lock
-    if _generate_queue is None:
-        _generate_queue = asyncio.Queue()
-    if _generate_lock is None:
-        _generate_lock = asyncio.Lock()
-
-
-async def _ensure_worker_running(engine_client, app_id: int):
-    """Ensure the generate worker is running."""
-    global _generate_worker_task
-    _ensure_queue_initialized()
-    
-    async with _generate_lock:
-        if _generate_worker_task is None or _generate_worker_task.done():
-            _generate_worker_task = asyncio.create_task(
-                _generate_worker_loop(engine_client, app_id)
-            )
-
-
-async def _generate_worker_loop(engine_client, app_id: int):
-    """Background worker that processes queued /generate jobs."""
-    logger.info("Generate queue worker started")
-    
-    while True:
-        try:
-            # Get next job (blocks until available)
-            job: GenerateJob = await _generate_queue.get()
-            
-            # Update status to running
-            if job.request_id in _generate_results:
-                _generate_results[job.request_id].status = "running"
-            
-            try:
-                # Wait if /init/generate is active
-                while _is_generation_active(job.app_id):
-                    await asyncio.sleep(0.1)
-                
-                # Process the job
-                result = await _process_generate_job(job)
-                
-                # Store result
-                if job.request_id in _generate_results:
-                    _generate_results[job.request_id].status = "completed"
-                    _generate_results[job.request_id].completed_at = time.time()
-                    _generate_results[job.request_id].result = result
-                
-                # Send callback if URL provided
-                if job.callback_url:
-                    await _send_generate_callback(job, result)
-                    
-            except Exception as e:
-                logger.error(f"Generate job {job.request_id} failed: {e}", exc_info=True)
-                if job.request_id in _generate_results:
-                    _generate_results[job.request_id].status = "failed"
-                    _generate_results[job.request_id].completed_at = time.time()
-                    _generate_results[job.request_id].error = str(e)
-            
-            # Cleanup old results
-            _cleanup_old_results()
-            
-        except asyncio.CancelledError:
-            logger.info("Generate queue worker stopped")
-            break
-        except Exception as e:
-            logger.error(f"Generate worker error: {e}", exc_info=True)
-            await asyncio.sleep(1)  # Avoid tight loop on repeated errors
-
-
-async def _process_generate_job(job: GenerateJob) -> Dict[str, Any]:
-    """Process a single generate job (same logic as wait=true path)."""
-    computed_artifacts = []
-    
-    for i in range(0, len(job.nonces), job.batch_size):
-        chunk = job.nonces[i:i + job.batch_size]
-        chunk_start_time = time.time()
-        
-        while True:
-            # Wait if /init/generate became active
-            while _is_generation_active(job.app_id):
-                await asyncio.sleep(0.1)
-            
-            result = await job.engine_client.poc_request("generate_artifacts", {
-                "nonces": chunk,
-                "block_hash": job.block_hash,
-                "public_key": job.public_key,
-                "seq_len": job.seq_len,
-                "k_dim": job.k_dim,
-            })
-            
-            if not result.get("skipped"):
-                computed_artifacts.extend(result.get("artifacts", []))
-                break
-            
-            elapsed = time.time() - chunk_start_time
-            if elapsed >= POC_GENERATE_CHUNK_TIMEOUT_SEC:
-                raise RuntimeError(
-                    f"Timeout waiting for engine: chunk {i//job.batch_size} "
-                    f"timed out after {elapsed:.1f}s"
-                )
-            
-            await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
-    
-    # If no validation, return artifacts
-    if job.validation_artifacts is None:
-        return {
-            "status": "completed",
-            "request_id": job.request_id,
-            "artifacts": computed_artifacts,
-            "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le"},
-        }
-    
-    # Validation mode
-    n_mismatch = 0
-    mismatch_nonces = []
-    
-    for artifact in computed_artifacts:
-        nonce = artifact["nonce"]
-        computed_b64 = artifact["vector_b64"]
-        received_b64 = job.validation_artifacts.get(nonce)
-        
-        if received_b64:
-            computed_vec = decode_vector(computed_b64)
-            received_vec = decode_vector(received_b64)
-            distance = np.linalg.norm(computed_vec - received_vec)
-            
-            if distance > job.stat_test_dist_threshold:
-                n_mismatch += 1
-                mismatch_nonces.append(nonce)
-    
-    n_total = len(job.nonces)
-    p_value, fraud_detected = fraud_test(
-        n_mismatch, n_total,
-        job.stat_test_p_mismatch, job.stat_test_fraud_threshold
-    )
-    
-    return {
-        "status": "completed",
-        "request_id": job.request_id,
-        "n_total": n_total,
-        "n_mismatch": n_mismatch,
-        "mismatch_nonces": mismatch_nonces,
-        "p_value": p_value,
-        "fraud_detected": fraud_detected,
-    }
-
-
-async def _send_generate_callback(job: GenerateJob, result: Dict[str, Any]):
-    """Send callback for completed generate job."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            if job.validation_artifacts is None:
-                # Compute-only: POST to /generated
-                payload = {
-                    "request_id": job.request_id,
-                    "block_hash": job.block_hash,
-                    "block_height": job.block_height,
-                    "public_key": job.public_key,
-                    "node_id": job.node_id,
-                    "artifacts": result.get("artifacts", []),
-                    "encoding": result.get("encoding", {}),
-                }
-                await session.post(
-                    f"{job.callback_url}/generated",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                )
-            else:
-                # Validation: POST to /validated
-                payload = {
-                    "request_id": job.request_id,
-                    "block_hash": job.block_hash,
-                    "block_height": job.block_height,
-                    "public_key": job.public_key,
-                    "node_id": job.node_id,
-                    "n_total": result.get("n_total", 0),
-                    "n_mismatch": result.get("n_mismatch", 0),
-                    "mismatch_nonces": result.get("mismatch_nonces", []),
-                    "p_value": result.get("p_value", 1.0),
-                    "fraud_detected": result.get("fraud_detected", False),
-                }
-                await session.post(
-                    f"{job.callback_url}/validated",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                )
-    except Exception as e:
-        logger.warning(f"Generate callback failed for {job.request_id}: {e}")
-
-
-def _cleanup_old_results():
-    """Remove results older than TTL."""
-    now = time.time()
-    expired = [
-        rid for rid, rec in _generate_results.items()
-        if (rec.completed_at and now - rec.completed_at > GENERATE_RESULT_TTL_SEC)
-        or (not rec.completed_at and now - rec.created_at > GENERATE_RESULT_TTL_SEC * 2)
-    ]
-    for rid in expired:
-        del _generate_results[rid]
 
 
 # =============================================================================
@@ -299,51 +35,65 @@ def _cleanup_old_results():
 # =============================================================================
 
 class PoCParamsModel(BaseModel):
-    """Strict params for PoC requests."""
+    model_config = ConfigDict(extra="forbid")
     model: str
     seq_len: int
     k_dim: int = 12
 
 
 class PoCInitGenerateRequest(BaseModel):
-    """Request for /init/generate endpoint."""
     block_hash: str
     block_height: int
     public_key: str
     node_id: int
     node_count: int
-    batch_size: int = 32
+    group_id: int = 0
+    n_groups: int = 1
+    batch_size: int = POC_BATCH_SIZE_DEFAULT
     params: PoCParamsModel
     url: Optional[str] = None
 
 
+@dataclass
+class NonceIterator:
+    """Iterator for nonces with multi-node and multi-group support."""
+    node_id: int
+    n_nodes: int
+    group_id: int
+    n_groups: int
+    _current_x: int = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> int:
+        offset = self.node_id + self.group_id * self.n_nodes
+        step = self.n_groups * self.n_nodes
+        value = offset + self._current_x * step
+        self._current_x += 1
+        return value
+
+    def take(self, n: int) -> List[int]:
+        """Take the next n nonces."""
+        return [next(self) for _ in range(n)]
+
+
 class ArtifactModel(BaseModel):
-    """Single artifact for request/response."""
     nonce: int
     vector_b64: str
 
 
-class EncodingModel(BaseModel):
-    """Encoding metadata."""
-    dtype: str = "f16"
-    k_dim: int = 12
-    endian: str = "le"
-
-
 class ValidationModel(BaseModel):
-    """Artifacts to validate against."""
     artifacts: List[ArtifactModel]
 
 
 class StatTestModel(BaseModel):
-    """Statistical test parameters."""
     dist_threshold: float = DEFAULT_DIST_THRESHOLD
     p_mismatch: float = DEFAULT_P_MISMATCH
     fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
 
 
 class PoCGenerateRequest(BaseModel):
-    """Request for /generate endpoint."""
     block_hash: str
     block_height: int
     public_key: str
@@ -351,7 +101,7 @@ class PoCGenerateRequest(BaseModel):
     node_count: int
     nonces: List[int]
     params: PoCParamsModel
-    batch_size: int = 20
+    batch_size: int = POC_BATCH_SIZE_DEFAULT
     wait: bool = False
     url: Optional[str] = None
     validation: Optional[ValidationModel] = None
@@ -359,11 +109,10 @@ class PoCGenerateRequest(BaseModel):
 
 
 # =============================================================================
-# Helper Functions
+# Helpers
 # =============================================================================
 
 async def get_engine_client(request: Request):
-    """Get engine client from request app state."""
     engine_client = getattr(request.app.state, 'engine_client', None)
     if engine_client is None:
         raise HTTPException(status_code=503, detail="Engine not available")
@@ -371,56 +120,81 @@ async def get_engine_client(request: Request):
 
 
 async def check_poc_enabled(request: Request):
-    """Check if PoC is enabled."""
-    poc_enabled = getattr(request.app.state, 'poc_enabled', False)
-    if not poc_enabled:
+    if not getattr(request.app.state, 'poc_enabled', False):
         raise HTTPException(status_code=503, detail="PoC not enabled")
 
-
-def check_params_match(request: Request, params: PoCParamsModel):
-    """Check if model matches deployed model. Raises 409 if mismatch."""
-    # Get model names from openai_serving_models
-    serving_models = getattr(request.app.state, 'openai_serving_models', None)
-    if not serving_models or not hasattr(serving_models, 'base_model_paths'):
-        return  # No model info available
-    
-    base_paths = serving_models.base_model_paths
-    if not base_paths:
-        return
-    
-    model_path = base_paths[0].model_path
-    served_names = [p.name for p in base_paths]
-    
-    # Accept model path OR any served model name
-    valid_models = {model_path} | set(served_names)
-    if params.model not in valid_models:
+def _ensure_min_batch_size(batch_size: int):
+    if batch_size < POC_MIN_BATCH_SIZE:
         raise HTTPException(
-            status_code=409,
-            detail=f"model mismatch: requested={params.model}, valid={list(valid_models)}"
+            status_code=400,
+            detail={
+                "error": "batch_size too small",
+                "batch_size": batch_size,
+                "min_batch_size": POC_MIN_BATCH_SIZE,
+                "reason": (
+                    "PoC artifact vectors require fixed-shape batching for "
+                    "batch-shape invariance. batch_size<=2 is disallowed "
+                    "because attention backends may produce different outputs "
+                    "for the same nonce at very small batch sizes."
+                ),
+            },
         )
 
 
+def check_params_match(request: Request, params: PoCParamsModel):
+    """Check params match deployed config. Raises 409 on mismatch."""
+    serving_models = getattr(request.app.state, 'openai_serving_models', None)
+    if serving_models and hasattr(serving_models, 'base_model_paths'):
+        base_paths = serving_models.base_model_paths
+        if base_paths:
+            model_path = base_paths[0].model_path
+            served_names = [p.name for p in base_paths]
+            valid_models = {model_path} | set(served_names)
+            if params.model not in valid_models:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "params mismatch",
+                        "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim},
+                        "deployed": {"model": list(valid_models), "seq_len": None, "k_dim": None},
+                    }
+                )
+    
+    deployed = getattr(request.app.state, 'poc_deployed', None)
+    if deployed:
+        mismatches = []
+        if deployed.get("model") and params.model != deployed["model"]:
+            mismatches.append("model")
+        if deployed.get("seq_len") and params.seq_len != deployed["seq_len"]:
+            mismatches.append("seq_len")
+        if deployed.get("k_dim") and params.k_dim != deployed["k_dim"]:
+            mismatches.append("k_dim")
+        
+        if mismatches:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "params mismatch",
+                    "fields": mismatches,
+                    "requested": {"model": params.model, "seq_len": params.seq_len, "k_dim": params.k_dim},
+                    "deployed": deployed,
+                }
+            )
+
+
 def _is_generation_active(app_id: int) -> bool:
-    """Check if a generation loop is currently active for the given app."""
     tasks = _poc_tasks.get(app_id)
     if not tasks:
         return False
     gen_task = tasks.get("gen_task")
-    if gen_task is None:
-        return False
-    return not gen_task.done()
+    return gen_task is not None and not gen_task.done()
 
 
 def _get_api_status(app_id: int) -> dict:
-    """Get PoC status from API-owned state."""
     tasks = _poc_tasks.get(app_id)
     
     if not tasks or not _is_generation_active(app_id):
-        return {
-            "status": PoCState.IDLE.value,
-            "config": None,
-            "stats": None,
-        }
+        return {"status": PoCState.IDLE.value, "config": None, "stats": None}
     
     config = tasks.get("config", {})
     stats = tasks.get("stats", {})
@@ -437,6 +211,8 @@ def _get_api_status(app_id: int) -> dict:
             "public_key": config.get("public_key"),
             "node_id": config.get("node_id"),
             "node_count": config.get("node_count"),
+            "group_id": config.get("group_id"),
+            "n_groups": config.get("n_groups"),
             "seq_len": config.get("seq_len"),
             "k_dim": config.get("k_dim"),
         },
@@ -448,7 +224,6 @@ def _get_api_status(app_id: int) -> dict:
 
 
 async def _cancel_poc_tasks(app_id: int):
-    """Cancel running PoC tasks for an app."""
     tasks = _poc_tasks.pop(app_id, None)
     if tasks:
         if tasks.get("stop_event"):
@@ -459,62 +234,87 @@ async def _cancel_poc_tasks(app_id: int):
                 await tasks["gen_task"]
             except asyncio.CancelledError:
                 pass
-        if tasks.get("send_task"):
-            tasks["send_task"].cancel()
-            try:
-                await tasks["send_task"]
-            except asyncio.CancelledError:
-                pass
+        if tasks.get("callback_sender"):
+            tasks["callback_sender"].clear()
 
 
-# =============================================================================
-# Background Tasks for /init/generate
-# =============================================================================
 
-def _get_next_nonces(nonce_counter: int, batch_size: int, node_count: int) -> tuple:
-    """Generate next batch of nonces (API-side).
+async def _compute_artifacts_chunk(
+    engine_client,
+    nonces: List[int],
+    block_hash: str,
+    public_key: str,
+    seq_len: int,
+    k_dim: int,
+    pad_to: int,
+    timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
+    check_cancelled: Optional[callable] = None,
+) -> List[Dict]:
+    """Compute artifacts for a chunk with backoff on skip.
     
-    Returns:
-        (nonces_list, new_nonce_counter)
+    Uses fixed-shape padding to ensure batch-shape invariance:
+    nonces are padded to pad_to with negative dummy nonces, then
+    dummy artifacts are filtered out before returning.
     """
-    nonces = []
-    counter = nonce_counter
-    for _ in range(batch_size):
-        nonces.append(counter)
-        counter += node_count
-    return nonces, counter
+    original_nonces = set(nonces)
+    padded_nonces = pad_nonces(nonces, pad_to)
+    chunk_start_time = time.time()
+    
+    while True:
+        if check_cancelled and check_cancelled():
+            raise RuntimeError("Cancelled")
+        
+        result = await engine_client.poc_request("generate_artifacts", {
+            "nonces": padded_nonces,
+            "block_hash": block_hash,
+            "public_key": public_key,
+            "seq_len": seq_len,
+            "k_dim": k_dim,
+        })
+        
+        if not result.get("skipped"):
+            artifacts = result.get("artifacts", [])
+            return filter_artifacts(artifacts, original_nonces)
+        
+        elapsed = time.time() - chunk_start_time
+        if elapsed >= timeout_sec:
+            raise RuntimeError(f"Timeout after {elapsed:.1f}s")
+        
+        await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
 
+
+# =============================================================================
+# Generation Loop
+# =============================================================================
 
 async def _generation_loop(
     engine_client,
     stop_event: asyncio.Event,
-    artifact_queue: asyncio.Queue,
+    callback_sender: Optional[CallbackSender],
     config: dict,
     stats: dict,
 ):
-    """Continuous generation loop for /init/generate.
-    
-    Computes nonces in API layer and calls engine's generate_artifacts.
-    """
-    # Initialize nonce counter: start at node_id, stride by node_count
-    nonce_counter = config["node_id"]
+    nonce_iter = NonceIterator(
+        node_id=config["node_id"],
+        n_nodes=config["node_count"],
+        group_id=config["group_id"],
+        n_groups=config["n_groups"],
+    )
     batch_size = config["batch_size"]
-    node_count = config["node_count"]
     
     start_time = time.time()
     stats["start_time"] = start_time
     stats["total_processed"] = 0
     last_report_time = start_time
     
-    logger.info("PoC generation started")
-    
+    logger.info(f"PoC generation started (node {config['node_id']}/{config['node_count']}, group {config['group_id']}/{config['n_groups']})")
     skip_count = 0
     timeout_count = 0
+    pending_nonces = None
     
     try:
         while not stop_event.is_set():
-            # Generate next batch of nonces (API-side)
-            nonces, nonce_counter = _get_next_nonces(nonce_counter, batch_size, node_count)
+            nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
             
             try:
                 result = await engine_client.poc_request(
@@ -528,144 +328,51 @@ async def _generation_loop(
                     },
                     timeout_ms=POC_RPC_TIMEOUT_MS
                 )
-                timeout_count = 0  # Reset on successful RPC
+                timeout_count = 0
             except TimeoutError:
-                # Timeout is recoverable - engine is busy with chat inference
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    logger.warning(
-                        f"PoC generate_artifacts timed out (#{timeout_count}), "
-                        "engine busy with inference. Retrying..."
-                    )
-                # Roll back nonce counter since this batch wasn't processed
-                nonce_counter -= batch_size * node_count
+                    logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
+                pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
             
-            # Chat-priority: if skipped due to engine busy, backoff and retry
             if result.get("skipped"):
                 skip_count += 1
-                if skip_count % 100 == 1:  # Log every 100 skips (~5s at 50ms backoff)
+                if skip_count % 100 == 1:
                     logger.debug(f"PoC yielding to chat (skip #{skip_count})")
-                # Roll back nonce counter since this batch wasn't processed
-                nonce_counter -= batch_size * node_count
+                pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
                 continue
             
-            skip_count = 0  # Reset on successful batch
+            skip_count = 0
+            pending_nonces = None
             artifacts = result.get("artifacts", [])
             
-            if artifacts:
-                # Convert dict artifacts to Artifact objects for queue
-                artifact_objs = [
-                    Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"])
-                    for a in artifacts
-                ]
-                await artifact_queue.put({
+            if artifacts and callback_sender:
+                artifact_objs = [Artifact(nonce=a["nonce"], vector_b64=a["vector_b64"]) for a in artifacts]
+                callback_sender.add_artifacts(artifact_objs, {
                     "public_key": config["public_key"],
                     "block_hash": config["block_hash"],
                     "block_height": config["block_height"],
                     "node_id": config["node_id"],
-                    "artifacts": artifact_objs,
                 })
             
             stats["total_processed"] += len(nonces)
             
-            # Log progress every 5 seconds
             current_time = time.time()
             if current_time - last_report_time >= 5.0:
                 elapsed_min = (current_time - start_time) / 60
                 rate = stats["total_processed"] / elapsed_min if elapsed_min > 0 else 0
-                logger.info(f"Generated: {stats['total_processed']} nonces in {elapsed_min:.2f}min ({rate:.0f}/min)")
+                logger.info(f"Generated: {stats['total_processed']} nonces ({rate:.0f}/min)")
                 last_report_time = current_time
             
     except asyncio.CancelledError:
         elapsed_min = (time.time() - start_time) / 60
         logger.info(f"PoC stopped: {stats['total_processed']} nonces in {elapsed_min:.2f}min")
     except Exception as e:
-        elapsed_min = (time.time() - start_time) / 60
-        logger.error(
-            f"PoC generation loop crashed after {stats['total_processed']} nonces "
-            f"in {elapsed_min:.2f}min: {e}",
-            exc_info=True
-        )
+        logger.error(f"PoC generation crashed: {e}", exc_info=True)
         raise
-
-
-async def _callback_sender_loop(
-    artifact_queue: asyncio.Queue,
-    callback_url: str,
-    stop_event: asyncio.Event,
-    k_dim: int,
-):
-    """Batches artifacts and sends callbacks every POC_CALLBACK_INTERVAL_SEC."""
-    accumulated: List[Artifact] = []
-    last_send_time = time.time()
-    metadata = {}
-    
-    async with aiohttp.ClientSession() as session:
-        while not stop_event.is_set():
-            try:
-                # Wait for artifacts with timeout
-                batch = await asyncio.wait_for(
-                    artifact_queue.get(),
-                    timeout=1.0
-                )
-                accumulated.extend(batch["artifacts"])
-                metadata = {
-                    "public_key": batch["public_key"],
-                    "block_hash": batch["block_hash"],
-                    "block_height": batch["block_height"],
-                    "node_id": batch["node_id"],
-                }
-            except asyncio.TimeoutError:
-                pass
-            except asyncio.CancelledError:
-                break
-            
-            # Send if interval elapsed and we have data
-            current_time = time.time()
-            should_send = (
-                accumulated and 
-                (current_time - last_send_time >= POC_CALLBACK_INTERVAL_SEC or stop_event.is_set())
-            )
-            
-            if should_send:
-                payload = {
-                    **metadata,
-                    "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in accumulated],
-                    "encoding": {"dtype": "f16", "k_dim": k_dim, "endian": "le"},
-                }
-                
-                try:
-                    await session.post(
-                        f"{callback_url}/generated",
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    )
-                    logger.debug(f"Callback sent: {len(accumulated)} artifacts to {callback_url}/generated")
-                except Exception as e:
-                    logger.warning(f"Callback failed: {e}")
-                
-                accumulated = []
-                last_send_time = current_time
-    
-    # Send remaining on shutdown
-    if accumulated and callback_url:
-        try:
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    **metadata,
-                    "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in accumulated],
-                    "encoding": {"dtype": "f16", "k_dim": k_dim, "endian": "le"},
-                }
-                await session.post(
-                    f"{callback_url}/generated",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                )
-        except Exception:
-            pass
 
 
 # =============================================================================
@@ -674,107 +381,85 @@ async def _callback_sender_loop(
 
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    """Initialize PoC round and start continuous generation.
-    
-    Callbacks sent to {url}/generated every POC_CALLBACK_INTERVAL_SEC seconds.
-    All state (nonce counter, stats) is managed in the API layer.
-    """
     await check_poc_enabled(request)
     check_params_match(request, body.params)
+    _ensure_min_batch_size(body.batch_size)
     engine_client = await get_engine_client(request)
     
     app_id = id(request.app)
     
-    # Check for conflicts (API-owned state)
     if _is_generation_active(app_id):
         raise HTTPException(status_code=409, detail="Already generating")
     
-    # Cancel any lingering tasks
     await _cancel_poc_tasks(app_id)
     
-    # Build config
     config = {
         "block_hash": body.block_hash,
         "block_height": body.block_height,
         "public_key": body.public_key,
         "node_id": body.node_id,
         "node_count": body.node_count,
+        "group_id": body.group_id,
+        "n_groups": body.n_groups,
         "batch_size": body.batch_size,
         "seq_len": body.params.seq_len,
         "k_dim": body.params.k_dim,
     }
     
-    # Shared stats dict (updated by generation loop)
     stats = {"start_time": 0, "total_processed": 0}
-    
-    # Start background tasks
     stop_event = asyncio.Event()
-    artifact_queue: asyncio.Queue = asyncio.Queue()
+    
+    callback_sender = None
+    callback_task = None
+    if body.url:
+        callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
+        callback_task = asyncio.create_task(callback_sender.run())
     
     gen_task = asyncio.create_task(
-        _generation_loop(engine_client, stop_event, artifact_queue, config, stats)
+        _generation_loop(engine_client, stop_event, callback_sender, config, stats)
     )
-    
-    send_task = None
-    if body.url:
-        send_task = asyncio.create_task(
-            _callback_sender_loop(artifact_queue, body.url, stop_event, body.params.k_dim)
-        )
     
     _poc_tasks[app_id] = {
         "gen_task": gen_task,
-        "send_task": send_task,
+        "callback_task": callback_task,
+        "callback_sender": callback_sender,
         "stop_event": stop_event,
-        "queue": artifact_queue,
         "config": config,
         "stats": stats,
     }
     
-    return {
-        "status": "OK",
-        "pow_status": {"status": "GENERATING"},
-    }
+    return {"status": "OK", "pow_status": {"status": "GENERATING"}}
 
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
-    """Compute artifacts for specific nonces. Optionally validate against provided artifacts.
-    
-    - wait=true: process synchronously and return result
-    - wait=false: queue job and return request_id (poll GET /generate/{request_id} for result)
-    
-    If /init/generate is running, job is queued and waits until it's idle.
-    """
     await check_poc_enabled(request)
     check_params_match(request, body.params)
+    _ensure_min_batch_size(body.batch_size)
     engine_client = await get_engine_client(request)
     
     app_id = id(request.app)
     
-    # Validate nonce set match if validation provided
     if body.validation:
         validation_nonces = set(a.nonce for a in body.validation.artifacts)
-        request_nonces = set(body.nonces)
-        if validation_nonces != request_nonces:
-            raise HTTPException(
-                status_code=400,
-                detail="validation.artifacts nonces must match nonces field exactly"
-            )
+        if validation_nonces != set(body.nonces):
+            raise HTTPException(status_code=400, detail="validation.artifacts nonces must match nonces field")
     
-    # Build validation map if provided
-    validation_map = None
-    if body.validation:
-        validation_map = {a.nonce: a.vector_b64 for a in body.validation.artifacts}
-    
-    # Get stat_test params
+    validation_map = {a.nonce: a.vector_b64 for a in body.validation.artifacts} if body.validation else None
     stat_test = body.stat_test or StatTestModel()
     
-    # wait=false: enqueue and return immediately
     if not body.wait:
-        request_id = str(uuid.uuid4())
+        queue = get_queue()
+        queue.set_generation_active_check(_is_generation_active)
+        
+        if queue.queued_nonces + len(body.nonces) > POC_MAX_QUEUED_NONCES:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Queue full: {queue.queued_nonces} nonces queued, limit is {POC_MAX_QUEUED_NONCES}"
+            )
         
         job = GenerateJob(
-            request_id=request_id,
+            request_id=str(uuid.uuid4()),
             engine_client=engine_client,
             app_id=app_id,
             block_hash=body.block_hash,
@@ -793,59 +478,54 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             callback_url=body.url,
         )
         
-        # Store initial result record
-        _generate_results[request_id] = GenerateResult(status="queued")
+        request_id = await queue.enqueue(job)
+        if request_id is None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Queue full: {queue.queued_nonces} nonces queued, limit is {POC_MAX_QUEUED_NONCES}"
+            )
         
-        # Ensure worker is running and enqueue
-        await _ensure_worker_running(engine_client, app_id)
-        await _generate_queue.put(job)
+        await queue.ensure_worker_running(engine_client, app_id)
         
-        return {
-            "status": "queued",
-            "request_id": request_id,
-            "queued_count": len(body.nonces),
-        }
+        return {"status": "queued", "request_id": request_id, "queued_count": len(body.nonces)}
     
-    # wait=true: process synchronously (existing logic)
-    # Wait if /init/generate is active
     while _is_generation_active(app_id):
         await asyncio.sleep(0.1)
     
+    total_nonces = len(body.nonces)
+    n_chunks = (total_nonces + body.batch_size - 1) // body.batch_size
+    logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
+    
+    start_time = time.time()
     computed_artifacts = []
-    batch_size = body.batch_size
     
-    for i in range(0, len(body.nonces), batch_size):
-        chunk = body.nonces[i:i + batch_size]
-        chunk_start_time = time.time()
+    for i in range(0, total_nonces, body.batch_size):
+        chunk = body.nonces[i:i + body.batch_size]
+        chunk_idx = i // body.batch_size
         
-        while True:
-            # Wait if /init/generate became active
-            while _is_generation_active(app_id):
-                await asyncio.sleep(0.1)
-            
-            result = await engine_client.poc_request("generate_artifacts", {
-                "nonces": chunk,
-                "block_hash": body.block_hash,
-                "public_key": body.public_key,
-                "seq_len": body.params.seq_len,
-                "k_dim": body.params.k_dim,
-            })
-            
-            if not result.get("skipped"):
-                computed_artifacts.extend(result.get("artifacts", []))
-                break
-            
-            elapsed = time.time() - chunk_start_time
-            if elapsed >= POC_GENERATE_CHUNK_TIMEOUT_SEC:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Timeout waiting for engine: chunk {i//batch_size} "
-                           f"timed out after {elapsed:.1f}s"
-                )
-            
-            await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
+        def check_cancelled():
+            return False
+        
+        while _is_generation_active(app_id):
+            await asyncio.sleep(0.1)
+        
+        try:
+            artifacts = await _compute_artifacts_chunk(
+                engine_client, chunk, body.block_hash, body.public_key,
+                body.params.seq_len, body.params.k_dim,
+                pad_to=body.batch_size,
+                timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
+                check_cancelled=check_cancelled,
+            )
+            computed_artifacts.extend(artifacts)
+            logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
     
-    # If no validation, return computed artifacts
+    elapsed = time.time() - start_time
+    rate = total_nonces / elapsed if elapsed > 0 else 0
+    logger.info(f"PoC /generate completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")
+    
     if not body.validation:
         return {
             "status": "completed",
@@ -854,79 +534,28 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
         }
     
-    # Validation mode: compare computed vs received
-    n_mismatch = 0
-    mismatch_nonces = []
-    
-    for artifact in computed_artifacts:
-        nonce = artifact["nonce"]
-        computed_b64 = artifact["vector_b64"]
-        received_b64 = validation_map.get(nonce)
-        
-        if received_b64:
-            computed_vec = decode_vector(computed_b64)
-            received_vec = decode_vector(received_b64)
-            distance = np.linalg.norm(computed_vec - received_vec)
-            
-            if distance > stat_test.dist_threshold:
-                n_mismatch += 1
-                mismatch_nonces.append(nonce)
-    
-    n_total = len(body.nonces)
-    p_value, fraud_detected = fraud_test(
-        n_mismatch, n_total,
-        stat_test.p_mismatch, stat_test.fraud_threshold
+    validation_result = run_validation(
+        computed_artifacts,
+        validation_map,
+        len(body.nonces),
+        stat_test.dist_threshold,
+        stat_test.p_mismatch,
+        stat_test.fraud_threshold,
     )
     
-    response = {
+    return {
         "status": "completed",
         "request_id": str(uuid.uuid4()),
-        "n_total": n_total,
-        "n_mismatch": n_mismatch,
-        "mismatch_nonces": mismatch_nonces,
-        "p_value": p_value,
-        "fraud_detected": fraud_detected,
+        **validation_result,
     }
-    
-    # Send callback if URL provided
-    if body.url:
-        try:
-            async with aiohttp.ClientSession() as session:
-                callback_payload = {
-                    "request_id": response["request_id"],
-                    "block_hash": body.block_hash,
-                    "block_height": body.block_height,
-                    "public_key": body.public_key,
-                    "node_id": body.node_id,
-                    "n_total": n_total,
-                    "n_mismatch": n_mismatch,
-                    "mismatch_nonces": mismatch_nonces,
-                    "p_value": p_value,
-                    "fraud_detected": fraud_detected,
-                }
-                await session.post(
-                    f"{body.url}/validated",
-                    json=callback_payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                )
-        except Exception as e:
-            logger.warning(f"Validation callback failed: {e}")
-    
-    return response
 
 
 @router.get("/generate/{request_id}")
 async def get_generate_result(request: Request, request_id: str) -> dict:
-    """Poll for result of a queued /generate request.
-    
-    Returns:
-        - status: "queued" | "running" | "completed" | "failed"
-        - For "completed": same payload as synchronous /generate
-        - For "failed": error message
-    """
     await check_poc_enabled(request)
     
-    record = _generate_results.get(request_id)
+    queue = get_queue()
+    record = queue.get_result(request_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
     
@@ -942,24 +571,17 @@ async def get_generate_result(request: Request, request_id: str) -> dict:
 
 @router.get("/status")
 async def get_status(request: Request) -> dict:
-    """Get current PoC status (API-owned state)."""
     await check_poc_enabled(request)
-    
-    app_id = id(request.app)
-    return _get_api_status(app_id)
+    return _get_api_status(id(request.app))
 
 
 @router.post("/stop")
 async def stop_round(request: Request) -> dict:
-    """Stop current PoC round (cancels API background tasks)."""
     await check_poc_enabled(request)
     
     app_id = id(request.app)
     
-    # Cancel background tasks
     await _cancel_poc_tasks(app_id)
+    await clear_queue()
     
-    return {
-        "status": "OK", 
-        "pow_status": {"status": "STOPPED"},
-    }
+    return {"status": "OK", "pow_status": {"status": "STOPPED"}}
