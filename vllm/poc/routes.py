@@ -249,12 +249,16 @@ async def _compute_artifacts_chunk(
     pad_to: int,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
     check_cancelled: Optional[callable] = None,
-) -> List[Dict]:
+) -> tuple[List[Dict], Optional[Dict]]:
     """Compute artifacts for a chunk with backoff on skip.
     
     Uses fixed-shape padding to ensure batch-shape invariance:
     nonces are padded to pad_to with negative dummy nonces, then
     dummy artifacts are filtered out before returning.
+    
+    Returns:
+        (filtered_artifacts, intermediates_dict) where intermediates_dict
+        is None if not available, or a dict with intermediate state arrays.
     """
     original_nonces = set(nonces)
     padded_nonces = pad_nonces(nonces, pad_to)
@@ -274,7 +278,9 @@ async def _compute_artifacts_chunk(
         
         if not result.get("skipped"):
             artifacts = result.get("artifacts", [])
-            return filter_artifacts(artifacts, original_nonces)
+            filtered_artifacts = filter_artifacts(artifacts, original_nonces)
+            intermediates = result.get("intermediates")  # May be None
+            return filtered_artifacts, intermediates
         
         elapsed = time.time() - chunk_start_time
         if elapsed >= timeout_sec:
@@ -498,6 +504,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     start_time = time.time()
     computed_artifacts = []
+    all_intermediates = []  # Collect intermediates from all chunks
     
     for i in range(0, total_nonces, body.batch_size):
         chunk = body.nonces[i:i + body.batch_size]
@@ -510,7 +517,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             await asyncio.sleep(0.1)
         
         try:
-            artifacts = await _compute_artifacts_chunk(
+            artifacts, intermediates = await _compute_artifacts_chunk(
                 engine_client, chunk, body.block_hash, body.public_key,
                 body.params.seq_len, body.params.k_dim,
                 pad_to=body.batch_size,
@@ -518,6 +525,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 check_cancelled=check_cancelled,
             )
             computed_artifacts.extend(artifacts)
+            if intermediates is not None:
+                all_intermediates.append(intermediates)
             logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
@@ -526,13 +535,21 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     rate = total_nonces / elapsed if elapsed > 0 else 0
     logger.info(f"PoC /generate completed: {total_nonces} nonces in {elapsed:.2f}s ({rate:.0f}/s)")
     
+    response = {
+        "status": "completed",
+        "request_id": str(uuid.uuid4()),
+        "artifacts": computed_artifacts,
+        "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
+    }
+    
+    # Include intermediates if available (debug mode)
+    if all_intermediates:
+        # Merge intermediates from all chunks (for now, just include first chunk's)
+        # In practice, you might want to merge or keep separate per chunk
+        response["intermediates"] = all_intermediates[0] if len(all_intermediates) == 1 else all_intermediates
+    
     if not body.validation:
-        return {
-            "status": "completed",
-            "request_id": str(uuid.uuid4()),
-            "artifacts": computed_artifacts,
-            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
-        }
+        return response
     
     validation_result = run_validation(
         computed_artifacts,

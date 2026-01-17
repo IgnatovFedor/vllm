@@ -8,6 +8,8 @@ on the same vLLM server with chat priority.
 Usage:
     python scripts/poc_coexist_test.py
     python scripts/poc_coexist_test.py --model Qwen/Qwen3-0.6B
+    python scripts/poc_coexist_test.py --tensor-parallel-size 4
+    python scripts/poc_coexist_test.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8
 
 Requirements:
 - Server must run in multiprocessing engine mode (default for OpenAI API server)
@@ -19,44 +21,95 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import requests
 
 SERVER_PORT = 8766
-SERVER_STARTUP_TIMEOUT = 120
+SERVER_STARTUP_TIMEOUT = 600
 POC_WARMUP_TIME = 5
 CHAT_TIMEOUT = 60
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
+# Per-model config overrides for large models
+MODEL_MAX_LEN = {
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": 8192,  # Large model needs higher max_len
+}
 
-def start_vllm_server(model: str, log_file: Path) -> subprocess.Popen:
+MODEL_GPU_UTIL = {
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": 0.9,  # Use more GPU memory for large model
+}
+
+
+def _stream_logs(pipe, log_file, show_logs):
+    """Stream logs from pipe to file and optionally to stdout."""
+    with open(log_file, "w", buffering=1) as f:
+        for line in iter(pipe.readline, b''):
+            if not line:
+                break
+            line_str = line.decode('utf-8', errors='replace')
+            f.write(line_str)
+            f.flush()
+            if show_logs:
+                print(line_str.rstrip())
+
+
+def start_vllm_server(model: str, log_file: Path, tensor_parallel_size: int = 1, show_logs: bool = False) -> subprocess.Popen:
     """Start vLLM server with PoC enabled in MP mode."""
     env = os.environ.copy()
     env["VLLM_USE_V1"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
     
-    f = open(log_file, "w", buffering=1)
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-u", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", model,
-            "--enable-poc",
-            "--port", str(SERVER_PORT),
-            "--gpu-memory-utilization", "0.4",
-            "--max-model-len", "512",
-            # NOTE: Do NOT add --disable-frontend-multiprocessing
-            # MP mode is required for PoC+chat coexistence
-        ],
-        stdout=f,
-        stderr=subprocess.STDOUT,
-        env=env,
-        cwd=Path.cwd(),
-        start_new_session=True,
-    )
-    proc._log_file = f
+    # Get model-specific configs
+    max_model_len = MODEL_MAX_LEN.get(model, 512)
+    gpu_util = MODEL_GPU_UTIL.get(model, 0.4)
+    
+    cmd = [
+        sys.executable, "-u", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model,
+        "--enable-poc",
+        "--port", str(SERVER_PORT),
+        "--gpu-memory-utilization", str(gpu_util),
+        "--max-model-len", str(max_model_len),
+        # NOTE: Do NOT add --disable-frontend-multiprocessing
+        # MP mode is required for PoC+chat coexistence
+    ]
+    if tensor_parallel_size > 1:
+        cmd.extend(["--tensor-parallel-size", str(tensor_parallel_size)])
+    
+    if show_logs:
+        # Stream logs to both file and stdout
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=Path.cwd(),
+            start_new_session=True,
+        )
+        # Start thread to stream logs
+        log_thread = threading.Thread(
+            target=_stream_logs,
+            args=(proc.stdout, log_file, show_logs),
+            daemon=True
+        )
+        log_thread.start()
+        proc._log_thread = log_thread
+    else:
+        # Just write to file
+        f = open(log_file, "w", buffering=1)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=Path.cwd(),
+            start_new_session=True,
+        )
+        proc._log_file = f
     
     for i in range(SERVER_STARTUP_TIMEOUT):
         try:
@@ -70,7 +123,8 @@ def start_vllm_server(model: str, log_file: Path) -> subprocess.Popen:
             print(f"  Waiting for server... ({i}s)")
     
     proc.kill()
-    f.close()
+    if not show_logs and hasattr(proc, '_log_file') and proc._log_file:
+        proc._log_file.close()
     raise RuntimeError(f"vLLM server failed to start within {SERVER_STARTUP_TIMEOUT}s")
 
 
@@ -91,9 +145,13 @@ def stop_process(proc: subprocess.Popen):
             except ProcessLookupError:
                 pass
             proc.wait()
+    # Close log file if it exists
     if hasattr(proc, '_log_file') and proc._log_file:
         proc._log_file.flush()
         proc._log_file.close()
+    # Close stdout pipe if it exists (for streaming mode)
+    if hasattr(proc, 'stdout') and proc.stdout:
+        proc.stdout.close()
 
 
 def api_call(method: str, endpoint: str, json_data: dict = None, timeout: int = 30) -> dict:
@@ -152,12 +210,17 @@ def main():
     parser = argparse.ArgumentParser(description="PoC+Chat Coexistence E2E Test")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
                         help=f"Model to test (default: {DEFAULT_MODEL})")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1,
+                        help="Number of GPUs to use for tensor parallelism (default: 1)")
+    parser.add_argument("--show-logs", action="store_true",
+                        help="Show server logs in real-time during startup and execution")
     args = parser.parse_args()
     
     print("=" * 70)
     print("PoC+Chat Coexistence E2E Test")
     print("=" * 70)
     print(f"Model: {args.model}")
+    print(f"Tensor Parallel Size: {args.tensor_parallel_size}")
     print(f"Server port: {SERVER_PORT}")
     print()
     
@@ -179,7 +242,9 @@ def main():
         # Step 1: Start server
         # ====================================================================
         print("[1/5] Starting vLLM server (MP mode)...")
-        server_proc = start_vllm_server(args.model, log_file)
+        if args.show_logs:
+            print("      (Server logs will be shown below)")
+        server_proc = start_vllm_server(args.model, log_file, args.tensor_parallel_size, args.show_logs)
         results["server_started"] = True
         print("      Server started")
         

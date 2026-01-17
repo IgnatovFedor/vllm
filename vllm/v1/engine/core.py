@@ -566,7 +566,7 @@ class EngineCore:
             if self.scheduler.has_requests():
                 return {"skipped": True, "reason": "pending_input", "artifacts": []}
 
-            artifacts = manager.generate_artifacts(
+            artifacts, intermediates = manager.generate_artifacts(
                 nonces=payload.get("nonces", []),
                 block_hash=payload.get("block_hash", ""),
                 public_key=payload.get("public_key", ""),
@@ -574,12 +574,18 @@ class EngineCore:
                 k_dim=payload.get("k_dim", 12),
             )
 
-            return {
+            result = {
                 "artifacts": [
                     {"nonce": a.nonce, "vector_b64": a.vector_b64}
                     for a in artifacts
                 ]
             }
+            
+            # Pass through intermediates if available (debug mode)
+            if intermediates is not None:
+                result["intermediates"] = intermediates
+            
+            return result
 
         elif action == "status":
             return {"scheduler_has_requests": self.scheduler.has_requests()}

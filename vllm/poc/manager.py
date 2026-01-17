@@ -62,11 +62,16 @@ class PoCManager:
         public_key: str,
         seq_len: int,
         k_dim: int,
-    ) -> List[Artifact]:
+    ) -> tuple[List[Artifact], Optional[Dict[str, Any]]]:
         """Generate artifacts for specific nonces.
         
         This is the only public API. The caller provides nonces explicitly;
         nonce progression logic lives in the API layer.
+        
+        Returns:
+            (artifacts_list, intermediates_dict) where intermediates_dict
+            is None if not available (debug mode off), or a dict with
+            intermediate state arrays if POC_DEBUG_SAVE_INTERMEDIATES is enabled.
         """
         result = self._run_forward(
             block_hash,
@@ -77,12 +82,14 @@ class PoCManager:
         )
         
         if result is None:
-            return []
+            return [], None
         
-        vectors = result["vectors"]  # FP16 numpy array
+        vectors = result["vectors"]  # FP16 or FP32 numpy array
         artifacts = []
         for i, nonce in enumerate(result["nonces"]):
             vector_b64 = encode_vector(vectors[i])
             artifacts.append(Artifact(nonce=nonce, vector_b64=vector_b64))
         
-        return artifacts
+        intermediates = result.get("intermediates")  # May be None
+        
+        return artifacts, intermediates

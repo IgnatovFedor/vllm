@@ -5,6 +5,7 @@ This mimics vLLM's /chat/completion TP synchronization:
 - Non-driver TP workers block until they receive the broadcast
 - All TP ranks then enter model forward together (NCCL collectives align)
 """
+import os
 from typing import List, Optional, Dict, Any
 
 import torch
@@ -24,6 +25,15 @@ from vllm.sequence import IntermediateTensors
 
 # Default k_dim (can be overridden per-request)
 DEFAULT_K_DIM = 12
+
+# Debug flags for isolating transformations (set via environment variables)
+POC_DEBUG_DISABLE_LAYER_HOOKS = os.environ.get("POC_DEBUG_DISABLE_LAYER_HOOKS", "false").lower() == "true"
+POC_DEBUG_DISABLE_NORM1 = os.environ.get("POC_DEBUG_DISABLE_NORM1", "false").lower() == "true"
+POC_DEBUG_DISABLE_PICK = os.environ.get("POC_DEBUG_DISABLE_PICK", "false").lower() == "true"
+POC_DEBUG_DISABLE_HAAR = os.environ.get("POC_DEBUG_DISABLE_HAAR", "false").lower() == "true"
+POC_DEBUG_DISABLE_NORM2 = os.environ.get("POC_DEBUG_DISABLE_NORM2", "false").lower() == "true"
+POC_DEBUG_DISABLE_FP16 = os.environ.get("POC_DEBUG_DISABLE_FP16", "false").lower() == "true"
+POC_DEBUG_SAVE_INTERMEDIATES = os.environ.get("POC_DEBUG_SAVE_INTERMEDIATES", "false").lower() == "true"
 
 
 def _ensure_layer_hooks(worker, block_hash: str, hidden_size: int) -> None:
@@ -192,17 +202,27 @@ def execute_poc_forward(
     num_tokens = batch_size * seq_len
     dummy_input_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
     # Ensure layer hooks are installed for this block_hash (lazy + cached)
-    _ensure_layer_hooks(worker, block_hash, hidden_size)
+    if not POC_DEBUG_DISABLE_LAYER_HOOKS:
+        _ensure_layer_hooks(worker, block_hash, hidden_size)
 
     # Forward pass with PoC context (activates layer hook transformations)
     with set_forward_context(attn_metadata, worker_vllm_config):
-        with poc_forward_context():
+        if POC_DEBUG_DISABLE_LAYER_HOOKS:
+            # Run without PoC context (hooks won't activate)
             hidden_states = model(
                 input_ids=dummy_input_ids,
                 positions=positions.flatten(),
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
             )
+        else:
+            with poc_forward_context():
+                hidden_states = model(
+                    input_ids=dummy_input_ids,
+                    positions=positions.flatten(),
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+                )
 
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
@@ -216,21 +236,58 @@ def execute_poc_forward(
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
     last_hidden = hidden_states[:, -1, :].float()
     
-    # Normalize to unit sphere
-    last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
+    # Debug: Save intermediate states if requested
+    intermediates = {}
+    if POC_DEBUG_SAVE_INTERMEDIATES:
+        intermediates["raw_last_hidden"] = last_hidden.clone().cpu().numpy().tolist()
     
-    # Per-nonce k-dim pick + Haar rotation (via Householder chain, no cuSOLVER)
-    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
-    xk = torch.gather(last_hidden, 1, indices)
-    yk = apply_haar_rotation(block_hash, public_key, nonces, xk, device)
+    # Normalize to unit sphere (optional)
+    if not POC_DEBUG_DISABLE_NORM1:
+        last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
     
-    # Normalize output vectors
-    yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
+    if POC_DEBUG_SAVE_INTERMEDIATES:
+        intermediates["after_norm1"] = last_hidden.clone().cpu().numpy().tolist()
     
-    # Convert to FP16 for artifact encoding (compute was in FP32)
-    vectors_f16 = yk.half().cpu().numpy()
+    # Per-nonce k-dim pick (optional)
+    if POC_DEBUG_DISABLE_PICK:
+        # Use first k dimensions instead of deterministic pick
+        xk = last_hidden[:, :k_dim]
+    else:
+        indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
+        xk = torch.gather(last_hidden, 1, indices)
     
-    return {
+    if POC_DEBUG_SAVE_INTERMEDIATES:
+        intermediates["after_pick"] = xk.clone().cpu().numpy().tolist()
+    
+    # Haar rotation (optional)
+    if POC_DEBUG_DISABLE_HAAR:
+        yk = xk  # Identity (skip rotation)
+    else:
+        yk = apply_haar_rotation(block_hash, public_key, nonces, xk, device)
+    
+    if POC_DEBUG_SAVE_INTERMEDIATES:
+        intermediates["after_haar"] = yk.clone().cpu().numpy().tolist()
+    
+    # Normalize output vectors (optional)
+    if not POC_DEBUG_DISABLE_NORM2:
+        yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
+    
+    if POC_DEBUG_SAVE_INTERMEDIATES:
+        intermediates["after_norm2"] = yk.clone().cpu().numpy().tolist()
+    
+    # Convert to FP16 for artifact encoding (optional)
+    if POC_DEBUG_DISABLE_FP16:
+        vectors = yk.cpu().numpy()  # Keep FP32
+    else:
+        vectors_f16 = yk.half().cpu().numpy()
+        vectors = vectors_f16
+    
+    result = {
         "nonces": nonces,
-        "vectors": vectors_f16,  # FP16 numpy array, shape [batch_size, k_dim]
+        "vectors": vectors,  # FP16 or FP32 numpy array, shape [batch_size, k_dim]
     }
+    
+    if POC_DEBUG_SAVE_INTERMEDIATES:
+        result["intermediates"] = intermediates
+    
+    return result

@@ -45,15 +45,18 @@ MODELS = {
     "qwen": "Qwen/Qwen3-0.6B",
     "llama": "unsloth/Llama-3.2-1B-Instruct",
     "qwen4b": "Qwen/Qwen3-4B-Instruct-2507",
+    "qwen235b": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
 }
 
 # Per-model config overrides
 MODEL_MAX_LEN = {
     "qwen4b": 10256,
+    "qwen235b": 8192,  # Large model needs higher max_len
 }
 
 MODEL_GPU_UTIL = {
     "qwen4b": 0.9,
+    "qwen235b": 0.9,  # Use more GPU memory for large model
 }
 
 # 3x3 seed matrix
