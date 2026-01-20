@@ -211,23 +211,23 @@ def execute_poc_forward(
     elif hasattr(model_runner, 'attn_backend'):
         # v0 architecture
         actual_backend_info = model_runner.attn_backend.__class__.__name__
-
-    logger.info(
-        f"[TP Rank {tp_group.rank_in_group}/{tp_group.world_size}] "
-        "=" * 80 + "\n"
-        "HARDWARE & ATTENTION BACKEND INFO:\n"
-        f"  Platform: {platform_name}\n"
-        f"  Device: {device_name}\n"
-        f"  Compute Capability: {device_capability}\n"
-        f"  Dtype: {dtype}\n"
-        f"  Head Size: {head_size}\n"
-        f"  Block Size: {block_size}\n"
-        f"  KV Cache Dtype: {kv_cache_dtype}\n"
-        f"  Selected Attention Backend Class: {attn_backend_cls.__name__}\n"
-        f"  Selected Attention Backend Module: {attn_backend_cls.__module__}\n"
-        f"  Actual Model Backend: {actual_backend_info}\n"
-        + "=" * 80
-    )
+    if nonces[0] == 0: # Log only for first batch for brevity
+        logger.info(
+            f"[TP Rank {tp_group.rank_in_group}/{tp_group.world_size}] "
+            "=" * 80 + "\n"
+            "HARDWARE & ATTENTION BACKEND INFO:\n"
+            f"  Platform: {platform_name}\n"
+            f"  Device: {device_name}\n"
+            f"  Compute Capability: {device_capability}\n"
+            f"  Dtype: {dtype}\n"
+            f"  Head Size: {head_size}\n"
+            f"  Block Size: {block_size}\n"
+            f"  KV Cache Dtype: {kv_cache_dtype}\n"
+            f"  Selected Attention Backend Class: {attn_backend_cls.__name__}\n"
+            f"  Selected Attention Backend Module: {attn_backend_cls.__module__}\n"
+            f"  Actual Model Backend: {actual_backend_info}\n"
+            + "=" * 80
+        )
 
     # =========================================================================
     # TP SYNC: Pre-forward rendezvous
