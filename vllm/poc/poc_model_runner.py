@@ -7,6 +7,7 @@ This mimics vLLM's /chat/completion TP synchronization:
 """
 from typing import List, Optional, Dict, Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from vllm.platforms import current_platform
@@ -165,9 +166,9 @@ def execute_poc_forward(
             hidden_size = int(broadcast_data["hidden_size"])
             nonces = list(broadcast_data["nonces"])
             k_dim = int(broadcast_data["k_dim"])
-    
+
     batch_size = len(nonces)
-    
+
     # Generate embeddings on first PP rank, receive intermediate tensors on others
     intermediate_tensors = None
     inputs_embeds = None
@@ -187,6 +188,48 @@ def execute_poc_forward(
     
     # Create positions tensor
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    # ------------------------------------------------------------------
+    # Capture per-layer last-token hidden states via forward hooks
+    # ------------------------------------------------------------------
+    layer_last_hiddens: list[torch.Tensor] = []
+    hook_handles: list[Any] = []
+
+    def make_layer_hook(layer_idx: int):
+        def hook(module, inputs, outputs):
+            hs = outputs
+            if isinstance(hs, tuple):
+                hs = hs[0]
+
+            # Expect shape [batch * seq, hidden] or [batch, seq, hidden]
+            if hs.dim() == 2:
+                try:
+                    hs_3d = hs.view(batch_size, seq_len, -1)
+                except RuntimeError:
+                    # Fallback: skip if shape unexpected
+                    return
+            elif hs.dim() == 3:
+                hs_3d = hs
+            else:
+                # Unexpected shape, skip
+                return
+
+            last = hs_3d[:, -1, :].detach()
+            layer_last_hiddens.append(last)
+
+        return hook
+
+    # Attach hooks to transformer blocks if model exposes them
+    layers = getattr(model, "model", None)
+    if layers is not None:
+        layers = getattr(layers, "layers", None)
+    else:
+        layers = getattr(model, "layers", None)
+
+    if layers is not None:
+        for idx, layer in enumerate(layers):
+            h = layer.register_forward_hook(make_layer_hook(idx))
+            hook_handles.append(h)
 
     # For v1 architecture, we pass attn_metadata=None like profile runs do.
     # This avoids the complexity of building per-layer attention metadata dictionaries.
@@ -256,6 +299,10 @@ def execute_poc_forward(
                 inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
             )
 
+    # Remove hooks after forward
+    for h in hook_handles:
+        h.remove()
+
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
         if isinstance(hidden_states, IntermediateTensors):
@@ -263,7 +310,7 @@ def execute_poc_forward(
                 hidden_states.tensors, all_gather_group=get_tp_group()
             )
         return None
-    
+
     # Extract last token hidden state and compute in FP32
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
     last_hidden = hidden_states[:, -1, :].float()
@@ -281,12 +328,19 @@ def execute_poc_forward(
     
     # Normalize output vectors
     yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
-    
+
     # Convert to FP16 for artifact encoding (compute was in FP32)
     vectors_f16 = yk.half().cpu().numpy()
-    
+
+    # Convert per-layer last-token hidden states to numpy for export
+    per_layer_last_hidden_np: list[np.ndarray] = []
+    for lh in layer_last_hiddens:
+        # lh: [batch, hidden]
+        per_layer_last_hidden_np.append(lh.float().cpu().numpy().astype(np.float16))
+
     return {
         "nonces": nonces,
-        "vectors": vectors_f16,       # FP16 numpy array, shape [batch_size, k_dim]
+        "vectors": vectors_f16,  # FP16 numpy array, shape [batch_size, k_dim]
         "last_hidden": last_hidden_f16,  # FP16 numpy array, shape [batch_size, hidden_size]
+        "per_layer_last_hidden": per_layer_last_hidden_np,  # list[num_layers] of [batch_size, hidden_size]
     }
