@@ -3,7 +3,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export GPU_NAME=4070s
 python poc_forward_demo.py --mode generate --model Qwen/Qwen3-0.6B-FP8 --batch-size 8 -o ${GPU_NAME}_fp8
 python poc_forward_demo.py --mode generate --model RedHatAI/Qwen3-0.6B-quantized.w4a16 --batch-size 8 -o ${GPU_NAME}_int4
-python poc_forward_demo.py --mode compare --file-a gpu_fp8.npz --file-b gpu_int4.npz
+python poc_forward_demo.py --mode compare --file-a ${GPU_NAME}_fp8.npz --file-b ${GPU_NAME}_int4.npz
 """
 
 import argparse
