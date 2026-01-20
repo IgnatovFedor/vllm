@@ -9,7 +9,9 @@ from typing import List, Optional, Dict, Any
 
 import torch
 import torch.distributed as dist
-
+from vllm.platforms import current_platform
+from vllm.attention.selector import get_attn_backend
+from vllm.logger import init_logger
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.communication_op import broadcast_tensor_dict
@@ -24,6 +26,7 @@ from vllm.sequence import IntermediateTensors
 
 # Default k_dim (can be overridden per-request)
 DEFAULT_K_DIM = 12
+logger = init_logger(__name__)
 
 
 def _ensure_layer_hooks(worker, block_hash: str, hidden_size: int) -> None:
@@ -118,8 +121,28 @@ def execute_poc_forward(
     dtype = worker.model_runner.model_config.dtype
     model = worker.model_runner.model
     worker_vllm_config = worker.vllm_config
-    
+    model_config = worker.model_runner.model_config
+
+    platform_name = current_platform.device_name
+    device_capability = current_platform.get_device_capability()
+    device_name = current_platform.get_device_name()
+
+    # Get attention backend info
+    head_size = model_config.get_head_size()
+    kv_cache_dtype = getattr(worker_vllm_config.cache_config, 'kv_cache_dtype', None)
+    block_size = getattr(worker_vllm_config.cache_config, 'block_size', 16)
+
+    attn_backend_cls = get_attn_backend(
+        head_size=head_size,
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=block_size,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+    )
     tp_group = get_tp_group()
+
     is_tp_driver = tp_group.rank_in_group == 0
     
     # =========================================================================
@@ -176,7 +199,36 @@ def execute_poc_forward(
         # v0 architecture - create attention metadata
         attn_backend = model_runner.attn_backend
         attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
-    
+
+    actual_backend_info = "N/A"
+    if hasattr(model_runner, 'attn_groups'):
+        # v1 architecture
+        if len(model_runner.attn_groups) > 0 and len(model_runner.attn_groups[0]) > 0:
+            # Get first attention group's backend
+            first_group = model_runner.attn_groups[0][0]
+            if hasattr(first_group, 'backend'):
+                actual_backend_info = first_group.backend.__class__.__name__
+    elif hasattr(model_runner, 'attn_backend'):
+        # v0 architecture
+        actual_backend_info = model_runner.attn_backend.__class__.__name__
+
+    logger.info(
+        f"[TP Rank {tp_group.rank_in_group}/{tp_group.world_size}] "
+        "=" * 80 + "\n"
+        "HARDWARE & ATTENTION BACKEND INFO:\n"
+        f"  Platform: {platform_name}\n"
+        f"  Device: {device_name}\n"
+        f"  Compute Capability: {device_capability}\n"
+        f"  Dtype: {dtype}\n"
+        f"  Head Size: {head_size}\n"
+        f"  Block Size: {block_size}\n"
+        f"  KV Cache Dtype: {kv_cache_dtype}\n"
+        f"  Selected Attention Backend Class: {attn_backend_cls.__name__}\n"
+        f"  Selected Attention Backend Module: {attn_backend_cls.__module__}\n"
+        f"  Actual Model Backend: {actual_backend_info}\n"
+        + "=" * 80
+    )
+
     # =========================================================================
     # TP SYNC: Pre-forward rendezvous
     # =========================================================================
@@ -192,7 +244,7 @@ def execute_poc_forward(
     num_tokens = batch_size * seq_len
     dummy_input_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
     # Ensure layer hooks are installed for this block_hash (lazy + cached)
-    _ensure_layer_hooks(worker, block_hash, hidden_size)
+    # _ensure_layer_hooks(worker, block_hash, hidden_size)
 
     # Forward pass with PoC context (activates layer hook transformations)
     with set_forward_context(attn_metadata, worker_vllm_config):
@@ -218,6 +270,9 @@ def execute_poc_forward(
     
     # Normalize to unit sphere
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
+
+    # Detach and convert last_hidden for artifact/debug export
+    last_hidden_f16 = last_hidden.half().cpu().numpy()
     
     # Per-nonce k-dim pick + Haar rotation (via Householder chain, no cuSOLVER)
     indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
@@ -232,5 +287,6 @@ def execute_poc_forward(
     
     return {
         "nonces": nonces,
-        "vectors": vectors_f16,  # FP16 numpy array, shape [batch_size, k_dim]
+        "vectors": vectors_f16,       # FP16 numpy array, shape [batch_size, k_dim]
+        "last_hidden": last_hidden_f16,  # FP16 numpy array, shape [batch_size, hidden_size]
     }
