@@ -10,7 +10,6 @@ from typing import List, Optional, Dict, Any
 import torch
 import torch.distributed as dist
 
-from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.forward_context import set_forward_context
@@ -44,53 +43,6 @@ def _ensure_layer_hooks(worker, block_hash: str, hidden_size: int) -> None:
     
     hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
     worker._poc_layer_hooks = hook
-
-
-def _create_prefill_attn_metadata(
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-    attn_backend,
-):
-    """Create prefill attention metadata for the v1 attention backend.
-
-    Uses PAD_SLOT_ID for all slots to skip KV cache writes.
-    This creates v1-style FlashAttentionMetadata.
-    """
-    num_tokens = batch_size * seq_len
-
-    # query_start_loc: cumulative query lengths [0, seq_len, 2*seq_len, ...]
-    query_start_loc = torch.arange(
-        0, num_tokens + 1, seq_len, dtype=torch.int32, device=device
-    )
-
-    # seq_lens: tensor of sequence lengths
-    seq_lens_tensor = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-
-    # slot_mapping: all PAD_SLOT_ID to skip KV cache writes
-    slot_mapping = torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device)
-
-    # block_table: empty since we're not using KV cache
-    block_table = torch.empty((batch_size, 0), dtype=torch.int32, device=device)
-
-    # Import v1 FlashAttentionMetadata
-    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-
-    return FlashAttentionMetadata(
-        num_actual_tokens=num_tokens,
-        max_query_len=seq_len,
-        query_start_loc=query_start_loc,
-        max_seq_len=seq_len,
-        seq_lens=seq_lens_tensor,
-        block_table=block_table,
-        slot_mapping=slot_mapping,
-        # Cascade attention disabled for PoC
-        use_cascade=False,
-        common_prefix_len=0,
-        cu_prefix_query_lens=None,
-        prefix_kv_lens=None,
-        suffix_kv_lens=None,
-    )
 
 
 @torch.inference_mode()
@@ -168,14 +120,7 @@ def execute_poc_forward(
     # For v1 architecture, we pass attn_metadata=None like profile runs do.
     # This avoids the complexity of building per-layer attention metadata dictionaries.
     # The model will run without KV caching (which is what we want for PoC).
-    model_runner = worker.model_runner
-    if hasattr(model_runner, 'attn_groups'):
-        # v1 architecture - use None like profile runs
-        attn_metadata = None
-    else:
-        # v0 architecture - create attention metadata
-        attn_backend = model_runner.attn_backend
-        attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
+    attn_metadata = None
     
     # =========================================================================
     # TP SYNC: Pre-forward rendezvous

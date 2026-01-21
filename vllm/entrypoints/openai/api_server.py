@@ -1542,6 +1542,13 @@ def build_app(args: Namespace) -> FastAPI:
     app.root_path = args.root_path
 
     if args.enable_poc is True:
+        # PoC currently requires the v1 engine; v0 is not supported.
+        if not envs.VLLM_USE_V1:
+            raise RuntimeError(
+                "Error: --enable-poc requires the v1 engine "
+                "(set VLLM_USE_V1=1). v0 engine is not supported for PoC."
+            )
+
         from vllm.poc.routes import router as poc_router
         app.include_router(poc_router)
 
